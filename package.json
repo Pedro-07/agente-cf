@@ -1,0 +1,25 @@
+{
+  "name": "agente-whatsapp-microvix",
+  "version": "1.0.0",
+  "description": "Agente de IA para WhatsApp integrado ao Linx Microvix",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0",
+    "axios": "^1.13.6",
+    "dotenv": "^17.3.1",
+    "express": "^4.22.1",
+    "fast-xml-parser": "^4.4.0",
+    "xml2js": "^0.6.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
