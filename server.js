@@ -57,6 +57,14 @@ function getSessao(telefone) {
    👤 DETECÇÃO DE NOME DO CLIENTE
 ========================================================= */
 
+// Palavras que NÃO são nomes — saudações, palavrões, expressões comuns
+const NAO_SAO_NOMES = new Set([
+  "oi", "olá", "ola", "opa", "ei", "eai", "eaí", "alô", "alo",
+  "bom", "boa", "ok", "sim", "não", "nao", "fala", "hey", "hi",
+  "bora", "pode", "tem", "vai", "vem", "quer", "sou", "meu", "minha",
+  "pau", "bom", "dia", "tarde", "noite", "tudo", "bem", "certo",
+]);
+
 function detectarNome(texto) {
   const invalidos = [
     /deus/i, /jesus/i, /fiel/i, /senhor/i, /cristo/i, /gloria/i,
@@ -74,47 +82,16 @@ function detectarNome(texto) {
   if (primeiroNome.length < 2) return null;
   if (!/^[A-ZÁÉÍÓÚÂÊÎÔÛÀÃÕÇ]/.test(primeiroNome)) return null;
 
+  // Bloqueia palavras comuns que não são nomes
+  if (NAO_SAO_NOMES.has(primeiroNome.toLowerCase())) return null;
+
+  // Nome deve ter pelo menos 3 caracteres para evitar falsos positivos
+  if (primeiroNome.length < 3) return null;
+
   return primeiroNome;
 }
 
-/* =========================================================
-   🎙️ TRANSCRIÇÃO DE ÁUDIO VIA CLAUDE
-========================================================= */
 
-async function transcreverAudio(base64Audio, mimetype = "audio/ogg") {
-  try {
-    console.log("🎙️ Transcrevendo áudio com Claude...");
-
-    const response = await anthropic.messages.create({
-      model:      CONFIG.anthropic.model,
-      max_tokens: 512,
-      messages: [{
-        role: "user",
-        content: [
-          {
-            type:   "document",
-            source: {
-              type:       "base64",
-              media_type: mimetype,
-              data:       base64Audio,
-            },
-          },
-          {
-            type: "text",
-            text: "Transcreva este áudio em português. Retorne apenas o texto transcrito, sem comentários.",
-          },
-        ],
-      }],
-    });
-
-    const transcricao = response.content.find(b => b.type === "text")?.text?.trim() || null;
-    console.log(`🎙️ Transcrito: ${transcricao}`);
-    return transcricao;
-  } catch (err) {
-    console.error("❌ Erro ao transcrever áudio:", err.message);
-    return null;
-  }
-}
 
 /* =========================================================
    🔧 MICROVIX — helpers
@@ -561,7 +538,7 @@ async function executarAgente(mensagem, sessao) {
 
 async function simularDigitando(telefone, duracaoMs) {
   try {
-    const numero = telefone.replace("@s.whatsapp.net", "");
+    const numero = limparNumero(telefone);
     await axios.post(
       `${CONFIG.whatsapp.url}/chat/sendPresence/${CONFIG.whatsapp.instance}`,
       { number: numero, presence: "composing", delay: duracaoMs },
@@ -572,10 +549,9 @@ async function simularDigitando(telefone, duracaoMs) {
   }
 }
 
-// Aceita números reais (@s.whatsapp.net) e LIDs (@lid)
-// LIDs são usados pelo WhatsApp para contatos não salvos na agenda
+// Aceita @s.whatsapp.net e @lid — grupos (@g.us) são ignorados
 function telefoneValido(telefone) {
-  return !!(telefone?.includes("@s.whatsapp.net") || telefone?.includes("@lid"));
+  return !!(telefone && !telefone.includes("@g.us") && !telefone.includes("@broadcast"));
 }
 
 function limparNumero(telefone) {
@@ -584,13 +560,55 @@ function limparNumero(telefone) {
     .replace("@lid", "");
 }
 
+// Resolve número real a partir de um LID via POST /chat/findContacts
+async function resolverLid(lid) {
+  try {
+    const res = await axios.post(
+      `${CONFIG.whatsapp.url}/chat/findContacts/${CONFIG.whatsapp.instance}`,
+      { where: { id: lid } },
+      { headers: { apikey: CONFIG.whatsapp.apiKey, "Content-Type": "application/json" } }
+    );
+
+    const lista = Array.isArray(res.data) ? res.data : [res.data];
+    const contato = lista.find(c => c?.id?.includes("@s.whatsapp.net") || c?.remoteJid?.includes("@s.whatsapp.net"));
+    const jid = contato?.id || contato?.remoteJid || null;
+
+    if (jid) {
+      console.log(`🔄 LID resolvido: ${lid} → ${jid}`);
+      return jid;
+    }
+
+    console.warn(`⚠️ findContacts sem JID válido:`, JSON.stringify(res.data).substring(0, 200));
+  } catch (err) {
+    console.error("❌ Erro ao resolver LID:", err.response?.data || err.message);
+  }
+
+  // Último recurso: tenta enviar direto com o LID
+  console.warn(`⚠️ Tentando envio direto para LID: ${lid}`);
+  return lid;
+}
+
 async function enviarTexto(telefone, texto) {
   if (!telefoneValido(telefone)) {
     console.warn(`⚠️ Telefone inválido ignorado: ${telefone}`);
     return;
   }
+
+  let jid = telefone;
+
+  // Se for LID, tenta resolver para número real
+  if (telefone.includes("@lid")) {
+    const resolvido = await resolverLid(telefone);
+    if (resolvido) {
+      jid = resolvido;
+    } else {
+      console.warn(`⚠️ Não foi possível resolver LID: ${telefone} — ignorando envio`);
+      return;
+    }
+  }
+
   try {
-    const numero = limparNumero(telefone);
+    const numero = limparNumero(jid);
     await axios.post(
       `${CONFIG.whatsapp.url}/message/sendText/${CONFIG.whatsapp.instance}`,
       { number: numero, textMessage: { text: texto } },
@@ -598,7 +616,7 @@ async function enviarTexto(telefone, texto) {
     );
     console.log(`📤 Texto enviado para ${numero}`);
   } catch (err) {
-    console.error("❌ Erro ao enviar texto:", err.response?.data || err.message);
+    console.error("❌ Erro ao enviar texto:", JSON.stringify(err.response?.data, null, 2) || err.message);
   }
 }
 
@@ -607,8 +625,20 @@ async function enviarImagem(telefone, url) {
     console.warn(`⚠️ Telefone inválido ignorado: ${telefone}`);
     return;
   }
+
+  let jid = telefone;
+  if (telefone.includes("@lid")) {
+    const resolvido = await resolverLid(telefone);
+    if (resolvido) {
+      jid = resolvido;
+    } else {
+      console.warn(`⚠️ Não foi possível resolver LID para imagem: ${telefone}`);
+      return;
+    }
+  }
+
   try {
-    const numero = limparNumero(telefone);
+    const numero = limparNumero(jid);
 
     // Envia imagem via URL direta (funciona em todas as versões da Evolution API)
     // Tenta v2 primeiro, depois v1 como fallback
@@ -692,7 +722,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
     const telefone = data?.data?.key?.remoteJid;
     if (!telefone) return;
 
-    // Bloqueia apenas formatos completamente inválidos
+    // Bloqueia grupos e broadcasts — aceita @s.whatsapp.net e @lid
     if (!telefoneValido(telefone)) {
       console.warn(`⚠️ Telefone inválido ignorado: ${telefone}`);
       return;
@@ -707,20 +737,12 @@ app.post("/webhook/whatsapp", async (req, res) => {
       msg?.imageMessage?.caption || "";
 
     if (!textoFinal.trim()) {
-      const isAudio  = !!(msg?.audioMessage || msg?.pttMessage);
-      const base64   = data?.data?.message?.base64;
-      const mimetype = msg?.audioMessage?.mimetype || msg?.pttMessage?.mimetype || "audio/ogg";
+      const isAudio = !!(msg?.audioMessage || msg?.pttMessage);
 
-      if (isAudio && base64) {
-        console.log("🎙️ Áudio recebido de", telefone);
-        await simularDigitando(telefone, 3000);
-
-        textoFinal = await transcreverAudio(base64, mimetype);
-
-        if (!textoFinal) {
-          await enviarTexto(telefone, "Não consegui entender o áudio. Pode digitar sua mensagem?");
-          return;
-        }
+      if (isAudio) {
+        console.log("🎙️ Áudio recebido de", telefone, "— solicitando texto");
+        await enviarTexto(telefone, "Por enquanto só consigo responder mensagens de texto. Pode digitar sua dúvida?");
+        return;
       }
     }
 
