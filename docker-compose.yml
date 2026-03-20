@@ -1,0 +1,98 @@
+services:
+
+  # ─── PostgreSQL (banco da Evolution API) ───────────────────────
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_DB: evolution
+      POSTGRES_USER: evolution
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-evolution123}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evolution"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ─── Evolution API (WhatsApp) ──────────────────────────────────
+  evolution-api:
+    # v2: suporte nativo a LIDs do WhatsApp.
+    # Requer autenticação via QR code a partir de IP residencial —
+    # IPs de datacenter (Railway, Oracle, etc.) são rejeitados pelo WhatsApp
+    # durante o handshake criptográfico do Baileys em novos registros.
+    image: atendai/evolution-api:v2.2.3
+    restart: always
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      # SERVER_URL deve ser a URL pública acessível externamente.
+      # Com ngrok local: copiar a URL gerada (ex: https://xxxx.ngrok.io).
+      SERVER_URL: ${EVOLUTION_SERVER_URL:-http://localhost:8080}
+
+      # Autenticação
+      AUTHENTICATION_TYPE: apikey
+      AUTHENTICATION_API_KEY: ${EVOLUTION_API_KEY}
+      # Chave usada internamente para assinar tokens JWT das instâncias
+      AUTHENTICATION_JWT_SECRET: ${EVOLUTION_JWT_SECRET:-troque-este-segredo}
+
+      # Banco de dados PostgreSQL
+      DATABASE_ENABLED: "true"
+      DATABASE_PROVIDER: postgresql
+      DATABASE_CONNECTION_URI: postgresql://evolution:${POSTGRES_PASSWORD:-evolution123}@postgres:5432/evolution
+      DATABASE_SAVE_DATA_INSTANCE: "true"
+      DATABASE_SAVE_DATA_NEW_MESSAGE: "true"
+      DATABASE_SAVE_MESSAGE_UPDATE: "true"
+      DATABASE_SAVE_DATA_CONTACTS: "true"
+      DATABASE_SAVE_DATA_CHATS: "true"
+
+      # Cache Redis desativado — usando cache local
+      CACHE_REDIS_ENABLED: "false"
+      CACHE_LOCAL_ENABLED: "true"
+
+      # Versão do WhatsApp Web — vazio força buscar a versão mais recente automaticamente
+      CONFIG_SESSION_PHONE_VERSION: ""
+
+      # Configurações gerais
+      LANGUAGE: pt-BR
+      DEL_INSTANCE: "false"
+      QRCODE_LIMIT: "30"
+
+      # Logs — reduzir para "ERROR" em produção para menos ruído
+      LOG_LEVEL: "ERROR,WARN,INFO"
+    volumes:
+      - evolution_store:/evolution/store
+
+  # ─── Agente de IA (server.js) ──────────────────────────────────
+  agente:
+    build: .
+    restart: always
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      MICROVIX_USUARIO: ${MICROVIX_USUARIO}
+      MICROVIX_SENHA: ${MICROVIX_SENHA}
+      MICROVIX_CHAVE: ${MICROVIX_CHAVE}
+      MICROVIX_CNPJ: ${MICROVIX_CNPJ}
+      MICROVIX_GRUPO: ${MICROVIX_GRUPO}
+      EVOLUTION_API_URL: http://evolution-api:8080
+      EVOLUTION_API_KEY: ${EVOLUTION_API_KEY}
+      EVOLUTION_INSTANCE: ${EVOLUTION_INSTANCE}
+      # Caminho do arquivo de persistência de sessões dentro do container.
+      # Mapeado para ./data no host via volume abaixo — sobrevive a reinicializações.
+      SESSOES_FILE: /app/data/sessoes.json
+    volumes:
+      # Persiste o histórico de conversas entre reinicializações e deploys
+      - ./data:/app/data
+    depends_on:
+      - evolution-api
+
+volumes:
+  evolution_store:
+  postgres_data:

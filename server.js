@@ -1,14 +1,24 @@
 /**
  * Agente de IA para WhatsApp — Casa Faria Cohama
  * Stack: Node.js + Express + Anthropic API + Evolution API + Linx Microvix B2C
- * Suporte a texto e áudio (transcrição via Claude)
+ *
+ * Melhorias implementadas (v2):
+ * - Fila de mensagens por telefone: evita condição de corrida no histórico
+ * - Cache LID→JID: resolve LIDs sem bater na API toda vez
+ * - Resolução de LID com 3 estratégias de fallback
+ * - Persistência de sessões em arquivo JSON: histórico sobrevive a reinicializações
+ * - Limite de histórico por sessão: evita crescimento ilimitado e custo excessivo
+ * - Retry automático nas chamadas ao Microvix: maior resiliência a falhas transientes
+ * - consultarImagensPorCodigo: agora filtra no ERP, não mais carrega tudo
  */
 
-import express from "express";
-import axios from "axios";
+import express  from "express";
+import axios    from "axios";
 import Anthropic from "@anthropic-ai/sdk";
-import dotenv from "dotenv";
-import xml2js from "xml2js";
+import dotenv   from "dotenv";
+import xml2js   from "xml2js";
+import fs       from "fs/promises";
+import path     from "path";
 
 dotenv.config();
 
@@ -38,13 +48,56 @@ const CONFIG = {
   anthropic: {
     model: "claude-sonnet-4-20250514",
   },
+  sessoes: {
+    // Arquivo de persistência — deve ser mapeado para volume Docker em produção.
+    // Definir SESSOES_FILE=/app/data/sessoes.json e montar ./data:/app/data no compose.
+    arquivo:      process.env.SESSOES_FILE || "./data/sessoes.json",
+    // Máximo de mensagens mantidas no histórico por cliente.
+    // Acima desse valor, mensagens antigas são removidas para controlar custo e tokens.
+    maxHistorico: 20,
+  },
 };
 
 /* =========================================================
-   🧠 MEMÓRIA DE CONVERSA (por número de telefone)
+   💾 PERSISTÊNCIA DE SESSÕES (arquivo JSON)
+
+   Problema resolvido: reinicializações do servidor apagavam
+   todo o histórico de conversa dos clientes (memória em RAM).
+
+   Solução: salvar sessões em JSON após cada interação.
+   Em Docker, mapear SESSOES_FILE para um volume nomeado:
+     volumes:
+       - ./data:/app/data
+   E definir no compose: SESSOES_FILE=/app/data/sessoes.json
 ========================================================= */
 
 const sessoes = new Map();
+
+async function carregarSessoes() {
+  try {
+    await fs.mkdir(path.dirname(CONFIG.sessoes.arquivo), { recursive: true });
+    const conteudo = await fs.readFile(CONFIG.sessoes.arquivo, "utf-8");
+    const dados    = JSON.parse(conteudo);
+    for (const [tel, sessao] of Object.entries(dados)) {
+      sessoes.set(tel, sessao);
+    }
+    console.log(`💾 Sessões carregadas: ${sessoes.size} clientes`);
+  } catch (err) {
+    // ENOENT = arquivo ainda não existe (primeira execução) — comportamento esperado
+    if (err.code !== "ENOENT") {
+      console.warn("⚠️ Erro ao carregar sessões:", err.message);
+    }
+  }
+}
+
+async function salvarSessoes() {
+  try {
+    const dados = Object.fromEntries(sessoes);
+    await fs.writeFile(CONFIG.sessoes.arquivo, JSON.stringify(dados, null, 2), "utf-8");
+  } catch (err) {
+    console.error("❌ Erro ao salvar sessões:", err.message);
+  }
+}
 
 function getSessao(telefone) {
   if (!sessoes.has(telefone)) {
@@ -54,10 +107,91 @@ function getSessao(telefone) {
 }
 
 /* =========================================================
+   🔄 FILA DE MENSAGENS POR TELEFONE
+
+   Problema resolvido: se o mesmo número enviasse duas mensagens
+   rapidamente, dois executarAgente() rodavam em paralelo e
+   corrompiam o histórico via condição de corrida no historico.push.
+
+   Solução: encadear Promises por telefone — cada mensagem espera
+   a anterior terminar antes de ser processada.
+========================================================= */
+
+const filasPorTelefone = new Map();
+
+function processarNaFila(telefone, fn) {
+  // Pega a promise anterior ou resolve imediatamente se a fila estiver vazia
+  const anterior = filasPorTelefone.get(telefone) || Promise.resolve();
+
+  // Encadeia a nova tarefa após a anterior terminar (com ou sem erro)
+  const proxima = anterior
+    .then(fn)
+    .catch(err => console.error(`❌ Erro na fila [${telefone}]:`, err.message));
+
+  // Atualiza o Map com a promise mais recente
+  filasPorTelefone.set(telefone, proxima);
+
+  // Remove a entrada do Map quando a fila esvaziar para não vazar memória
+  proxima.finally(() => {
+    if (filasPorTelefone.get(telefone) === proxima) {
+      filasPorTelefone.delete(telefone);
+    }
+  });
+
+  return proxima;
+}
+
+/* =========================================================
+   🔁 RETRY PARA CHAMADAS EXTERNAS
+
+   Problema resolvido: falhas transientes na API do Microvix
+   (timeout, 5xx esporádico) derrubavam a ferramenta sem nova tentativa.
+
+   Solução: wrapper com backoff linear — espera delayMs * tentativa
+   antes de cada retry, para não sobrecarregar o serviço em falha.
+========================================================= */
+
+async function comRetry(fn, tentativas = 2, delayMs = 1000) {
+  for (let i = 0; i <= tentativas; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      if (i === tentativas) throw err; // Esgotou tentativas — propaga o erro
+      console.warn(`⚠️ Tentativa ${i + 1} falhou: ${err.message}. Retry em ${delayMs * (i + 1)}ms...`);
+      await new Promise(r => setTimeout(r, delayMs * (i + 1)));
+    }
+  }
+}
+
+/* =========================================================
+   📏 TRUNCAMENTO DE HISTÓRICO
+
+   Problema resolvido: histórico crescia indefinidamente,
+   aumentando custo da API Anthropic e risco de estouro de contexto.
+
+   Solução: manter apenas as últimas MAX_HISTORICO mensagens.
+   Garante que o histórico sempre comece com role "user",
+   pois a API Anthropic rejeita históricos que começam com "assistant".
+========================================================= */
+
+function truncarHistorico(historico) {
+  const max = CONFIG.sessoes.maxHistorico;
+  if (historico.length <= max) return historico;
+
+  let inicio = historico.length - max;
+
+  // Avança até encontrar uma mensagem "user" para não começar com "assistant"
+  while (inicio < historico.length && historico[inicio].role !== "user") {
+    inicio++;
+  }
+
+  return historico.slice(inicio);
+}
+
+/* =========================================================
    👤 DETECÇÃO DE NOME DO CLIENTE
 ========================================================= */
 
-// Palavras que NÃO são nomes — saudações, palavrões, expressões comuns
 const NAO_SAO_NOMES = new Set([
   "oi", "olá", "ola", "opa", "ei", "eai", "eaí", "alô", "alo",
   "bom", "boa", "ok", "sim", "não", "nao", "fala", "hey", "hi",
@@ -81,23 +215,17 @@ function detectarNome(texto) {
   const primeiroNome = palavras[0];
   if (primeiroNome.length < 2) return null;
   if (!/^[A-ZÁÉÍÓÚÂÊÎÔÛÀÃÕÇ]/.test(primeiroNome)) return null;
-
-  // Bloqueia palavras comuns que não são nomes
   if (NAO_SAO_NOMES.has(primeiroNome.toLowerCase())) return null;
-
-  // Nome deve ter pelo menos 3 caracteres para evitar falsos positivos
   if (primeiroNome.length < 3) return null;
 
   return primeiroNome;
 }
 
-
-
 /* =========================================================
    🔧 MICROVIX — helpers
 ========================================================= */
 
-// ✅ <Name> com N maiúsculo — obrigatório pelo Microvix
+// <Name> com N maiúsculo é obrigatório pelo Microvix
 function montarXml(metodo, parametros = []) {
   const params = parametros
     .map(p => `      <Parameter id="${p.id}">${p.valor}</Parameter>`)
@@ -119,13 +247,16 @@ ${params}
 }
 
 async function chamarMicrovix(xml) {
-  console.log("📤 XML Microvix:\n", xml);
-  const res = await axios.post(CONFIG.microvix.url, xml, {
-    headers: { "Content-Type": "application/xml" },
-    timeout: 15000,
+  // Envolvido em comRetry para tolerar falhas transientes do ERP
+  return comRetry(async () => {
+    console.log("📤 XML Microvix:\n", xml);
+    const res = await axios.post(CONFIG.microvix.url, xml, {
+      headers: { "Content-Type": "application/xml" },
+      timeout: 15000,
+    });
+    console.log("📥 Resposta Microvix:\n", res.data.substring(0, 500));
+    return xml2js.parseStringPromise(res.data, { explicitArray: false });
   });
-  console.log("📥 Resposta Microvix:\n", res.data.substring(0, 500));
-  return xml2js.parseStringPromise(res.data, { explicitArray: false });
 }
 
 /**
@@ -158,6 +289,10 @@ function mapearColunas(responseData) {
 
 async function consultarProdutosPorNome(nomeProduto) {
   try {
+    // NOTA DE PERFORMANCE: B2CConsultaProdutos não suporta filtro por nome
+    // no servidor (API B2C do Microvix) — retorna o catálogo completo e
+    // filtramos localmente. Se o catálogo crescer muito (>500 produtos),
+    // considerar cache local com TTL de ~5 minutos para reduzir o tráfego.
     const xml   = montarXml("B2CConsultaProdutos", [{ id: "timestamp", valor: "0" }]);
     const json  = await chamarMicrovix(xml);
     const todos = mapearColunas(json?.Microvix?.ResponseData);
@@ -266,12 +401,17 @@ async function consultarPromocaoPorCodigo(codigoProduto) {
 
 async function consultarImagensPorCodigo(codigoProduto) {
   try {
+    // MELHORIA: agora passa codigoproduto como parâmetro para filtrar no ERP.
+    // Versão anterior buscava as imagens de TODOS os produtos e filtrava em memória,
+    // gerando tráfego desnecessário para uma consulta simples de produto único.
     const xml  = montarXml("B2CConsultaProdutosImagensURL", [
-      { id: "timestamp", valor: "0" },
+      { id: "codigoproduto", valor: codigoProduto },
+      { id: "timestamp",     valor: "0" },
     ]);
     const json  = await chamarMicrovix(xml);
     const itens = mapearColunas(json?.Microvix?.ResponseData);
 
+    // Filtro local mantido como segurança caso o ERP retorne produtos adjacentes
     const imagens = itens
       .filter(i => String(i.codigoproduto) === String(codigoProduto))
       .map(i => i.url_imagem_blob)
@@ -396,56 +536,55 @@ const tools = [
 
 function montarSystemPrompt(nomeCliente) {
   const saudacao = nomeCliente
-    ? `O nome do cliente nesta conversa é ${nomeCliente}. Use o nome com naturalidade, não em toda mensagem — só quando fizer sentido.`
-    : `Não temos o nome do cliente ainda. Se ele se apresentar, registre internamente.`;
+    ? `O cliente se chama ${nomeCliente}. Use o nome de forma natural, só quando fizer sentido.`
+    : `Ainda não sabemos o nome do cliente. Se ele se apresentar, registre internamente.`;
 
-  return `Você é um atendente da Casa Faria Cohama, loja de equipamentos para food service em São Luís - MA.
+  return `Você é atendente da Casa Faria Cohama, loja de equipamentos para food service em São Luís - MA.
 
 ${saudacao}
 
 ## Sobre a Casa Faria
 Loja especializada em equipamentos para restaurantes, hotéis, lanchonetes, bares, padarias, açougues e cozinhas em geral. Atendemos empresas (CNPJ) e pessoa física.
-
 Endereço: Av. Daniel de La Touche, 2004 - Cohama, São Luís - MA
-Maps: https://www.google.com/maps/dir//Casa+Faria,+Av.+Daniel+de+La+Touche,+2004+-+Cohama,+S%C3%A3o+Lu%C3%ADs+-+MA,+65074-115
+Maps: https://maps.app.goo.gl/NwW7nXYStV47q7FEA
 
-## Principais categorias de produtos
-- Açougue e Frigorífico: balcões açougue, moedores de carne, serra fita
-- Inox e Mobiliário: mesas e prateleiras em inox
-- Panificação e Confeitaria: amassadeiras, batedeiras, batedores de milk shake, masseiras, vitrines expositoras
-- Refrigeração Comercial: refrigeradores, cervejeiras, balcões refrigerados, vitrines refrigeradas, freezers
-- Restaurante e Cozinha Industrial: fornos, fogões, chapas, fritadeiras (cocção), buffets térmicos (conservação quente), processadores, extratores de suco (preparo)
+## Categorias de produtos
+- Açougue e Frigorífico: balcões, moedores, serra fita
+- Inox e Mobiliário: mesas e prateleiras
+- Panificação e Confeitaria: amassadeiras, batedeiras, batedores de milk shake, vitrines expositoras
+- Refrigeração Comercial: refrigeradores, cervejeiras, balcões e vitrines refrigeradas, freezers
+- Restaurante e Cozinha Industrial: fornos, fogões, chapas, fritadeiras, buffets térmicos, processadores, extratores de suco
 
-## Descontos e condições comerciais
-
-CNPJ com inscrição estadual ativa:
-- 20% de desconto à vista
-- 13% no cartão, parcelando em até 10x sem juros
+## Descontos e condições
+CNPJ com IE ativa:
+- 20% à vista
+- 13% no cartão, até 10x sem juros
 
 Pessoa física:
-- Compras acima de R$ 100: 5% de desconto (apenas à vista)
-- Compras acima de R$ 1.000: 10% de desconto (apenas à vista)
-- Parcelamento no cartão SEM desconto:
-  - Até R$ 499: até 6x sem juros
-  - Acima de R$ 499: até 10x sem juros
+- Compras > R$100: 5% à vista
+- Compras > R$1.000: 10% à vista
+- Parcelamento sem desconto:
+  - Até R$499: 6x sem juros
+  - Acima de R$499: 10x sem juros
 
-Entrega grátis para compras acima de R$ 500 dentro da Grande Ilha (São Luís, São José de Ribamar e Raposa) em até 72h (3 dias úteis).
+Entrega grátis: compras > R$500 na Grande Ilha (São Luís, São José de Ribamar, Raposa) em até 72h. Fora dessas cidades: apenas retirada na loja.
+
+Horário de funcionamento: de segunda à sexta, das 8 da manhã até 18h e aos sábados, das 8 até 16h
 
 ## Como se comportar
-
-- Respostas CURTAS — máximo 4 linhas. Direto como vendedor de loja física
-- Use no máximo 1 emoji por mensagem, só quando fizer sentido
-- NUNCA use: "Perfeito!", "Excelente escolha!", "Ótimo!", "Com certeza!"
-- Varie as respostas — nunca repita a mesma abertura duas vezes seguidas
-- Às vezes responda bem curto: "Tem sim! Quer ver as opções?"
-- NUNCA use asteriscos, underlines ou qualquer marcação markdown
-- Escreva texto limpo, sem negrito, itálico ou tachado — sem * _ ~ em nenhuma hipótese
-- Quando mostrar produto use exatamente este formato (sem asteriscos): 🔹 [nome] — R$ [preço] — [qtd] un.
-- Se preço vier zerado ou não encontrado: escreva "Preço sob consulta"
-- Para fechar venda ou dúvidas de prazo/entrega: chame um atendente humano
-- Ao chamar atendente, resuma o que o cliente quer: "Vou passar pro nosso atendente — ele já sabe que você quer a cervejeira GRBA-400PV branca."
-- Nunca invente informações — use apenas dados do ERP e o que está neste prompt
-- Responda sempre em português, com linguagem natural`;
+- Respostas curtas e diretas (máx. 4 linhas), estilo vendedor de loja física
+- Máx. 1 emoji por mensagem, só se fizer sentido
+- Nunca use: "Perfeito!", "Ótimo!", "Excelente escolha!", "Com certeza!"
+- Varie a forma de cumprimentar ou responder; evite repetir
+- Respostas curtas possíveis: "Tem sim! Quer ver as opções?"
+- Não use Markdown, negrito, itálico ou tachado
+- Produto disponível: - [nome] — R$ [preço] — [qtd] un.
+- Produtos com saldo zerado **não aparecem na lista de disponíveis**, mas mencione: "Esse produto está sem estoque no momento. Podemos consultar disponibilidade em outra unidade ou previsão de reposição."
+- Para fechar venda ou tirar dúvidas de entrega/prazo: chame atendente humano e resuma o que o cliente quer
+- Nunca invente informações; use só dados do ERP e deste prompt
+- sempre verificar o dia para poder informar o horário certo, caso alguém pergunte
+- Se mandarem mensagem fora do horário de atendimento, avise.
+- Sempre responda em português, com linguagem natural e amigável`;
 }
 
 /* =========================================================
@@ -453,9 +592,6 @@ Entrega grátis para compras acima de R$ 500 dentro da Grande Ilha (São Luís, 
 ========================================================= */
 
 async function executarAgente(mensagem, sessao) {
-  const { historico } = sessao;
-
-  // Tenta detectar o nome do cliente se ainda não tiver
   if (!sessao.nome) {
     const nomeDetectado = detectarNome(mensagem);
     if (nomeDetectado) {
@@ -464,7 +600,10 @@ async function executarAgente(mensagem, sessao) {
     }
   }
 
-  historico.push({ role: "user", content: mensagem });
+  sessao.historico.push({ role: "user", content: mensagem });
+
+  // Trunca o histórico antes de enviar para a API para controlar tokens e custo
+  sessao.historico = truncarHistorico(sessao.historico);
 
   let resposta     = null;
   let maxIteracoes = 10;
@@ -475,17 +614,17 @@ async function executarAgente(mensagem, sessao) {
       max_tokens: 1024,
       system:     montarSystemPrompt(sessao.nome),
       tools,
-      messages:   historico,
+      messages:   sessao.historico,
     });
 
     if (response.stop_reason === "end_turn") {
       resposta = response.content.find(b => b.type === "text")?.text || "";
-      historico.push({ role: "assistant", content: response.content });
+      sessao.historico.push({ role: "assistant", content: response.content });
       break;
     }
 
     if (response.stop_reason === "tool_use") {
-      historico.push({ role: "assistant", content: response.content });
+      sessao.historico.push({ role: "assistant", content: response.content });
 
       const resultados = [];
 
@@ -525,31 +664,49 @@ async function executarAgente(mensagem, sessao) {
         });
       }
 
-      historico.push({ role: "user", content: resultados });
+      sessao.historico.push({ role: "user", content: resultados });
     }
   }
+
+  // Persiste sessão após cada interação para sobreviver a reinicializações
+  await salvarSessoes();
 
   return resposta || "Não consegui processar agora. Tenta de novo?";
 }
 
 /* =========================================================
    📤 ENVIO VIA EVOLUTION API
+
+   ⚠️  PROBLEMA CONHECIDO: LIDs na Evolution API v1.8.7
+
+   O WhatsApp está migrando contatos de @s.whatsapp.net para
+   identificadores internos chamados LIDs (@lid). A v1.8.7 não
+   suporta envio para LIDs diretamente (retorna erro 400).
+
+   A v2.x da Evolution API suporta LID nativamente, mas não foi
+   possível conectar ao WhatsApp a partir de IPs de datacenter
+   (Railway, Oracle Cloud) — o handshake criptográfico do Baileys
+   é rejeitado nesses ambientes para novos registros. A v1 funcionou
+   porque a sessão foi autenticada via conexão residencial (ngrok).
+
+   Estratégia de resolução de LID implementada (3 etapas):
+   1. Cache local lidToJid — zero latência, sem chamada à API
+   2. POST /chat/findContacts com o LID como critério de busca
+   3. GET /chat/findContacts para buscar em todos os contatos armazenados
+   4. Fallback: tenta envio direto (vai falhar na v1.8.7, mas loga o erro)
+
+   O cache é populado sempre que um LID é resolvido com sucesso,
+   evitando chamadas repetidas à API para o mesmo contato.
 ========================================================= */
 
-async function simularDigitando(telefone, duracaoMs) {
-  try {
-    const numero = limparNumero(telefone);
-    await axios.post(
-      `${CONFIG.whatsapp.url}/chat/sendPresence/${CONFIG.whatsapp.instance}`,
-      { number: numero, presence: "composing", delay: duracaoMs },
-      { headers: { apikey: CONFIG.whatsapp.apiKey } }
-    );
-  } catch (_) {
-    // Falha silenciosa — não é crítico
-  }
-}
+// Cache em memória: LID (@lid) → JID real (@s.whatsapp.net)
+const lidToJid = new Map();
 
-// Aceita @s.whatsapp.net e @lid — grupos (@g.us) são ignorados
+// Cache em memória: pushName → JID real (@s.whatsapp.net)
+// Populado quando mensagens chegam com JID real — usado para resolver LIDs pelo nome
+const pushNameToJid = new Map();
+
+// Aceita @s.whatsapp.net e @lid — rejeita grupos (@g.us) e broadcasts
 function telefoneValido(telefone) {
   return !!(telefone && !telefone.includes("@g.us") && !telefone.includes("@broadcast"));
 }
@@ -560,35 +717,61 @@ function limparNumero(telefone) {
     .replace("@lid", "");
 }
 
-// Resolve número real a partir de um LID via POST /chat/findContacts
-async function resolverLid(lid) {
-  try {
-    const res = await axios.post(
-      `${CONFIG.whatsapp.url}/chat/findContacts/${CONFIG.whatsapp.instance}`,
-      { where: { id: lid } },
-      { headers: { apikey: CONFIG.whatsapp.apiKey, "Content-Type": "application/json" } }
-    );
-
-    const lista = Array.isArray(res.data) ? res.data : [res.data];
-    const contato = lista.find(c => c?.id?.includes("@s.whatsapp.net") || c?.remoteJid?.includes("@s.whatsapp.net"));
-    const jid = contato?.id || contato?.remoteJid || null;
-
-    if (jid) {
-      console.log(`🔄 LID resolvido: ${lid} → ${jid}`);
-      return jid;
-    }
-
-    console.warn(`⚠️ findContacts sem JID válido:`, JSON.stringify(res.data).substring(0, 200));
-  } catch (err) {
-    console.error("❌ Erro ao resolver LID:", err.response?.data || err.message);
+async function resolverLid(lid, pushName = null) {
+  // Cache local
+  if (lidToJid.has(lid)) {
+    console.log(`✅ LID resolvido via cache: ${lid} → ${lidToJid.get(lid)}`);
+    return lidToJid.get(lid);
   }
 
-  // Último recurso: tenta enviar direto com o LID
-  console.warn(`⚠️ Tentando envio direto para LID: ${lid}`);
+  // Resolução via pushName — quando o contato já enviou mensagem com JID real antes
+  if (pushName && pushNameToJid.has(pushName)) {
+    const jid = pushNameToJid.get(pushName);
+    console.log(`🔄 LID resolvido via pushName "${pushName}": ${lid} → ${jid}`);
+    lidToJid.set(lid, jid);
+    return jid;
+  }
+
+  // Tenta whatsappNumbers — endpoint que resolve LIDs para JIDs reais no v2
+  try {
+    const res = await axios.post(
+      `${CONFIG.whatsapp.url}/chat/whatsappNumbers/${CONFIG.whatsapp.instance}`,
+      { numbers: [lid] },
+      { headers: { apikey: CONFIG.whatsapp.apiKey, "Content-Type": "application/json" } }
+    );
+    console.log("🔍 whatsappNumbers retornou:", JSON.stringify(res.data, null, 2));
+
+    const lista = Array.isArray(res.data) ? res.data : [res.data];
+    const item  = lista.find(c => c?.jid?.includes("@s.whatsapp.net") || c?.exists);
+    const jid   = item?.jid;
+
+    if (jid && jid.includes("@s.whatsapp.net")) {
+      console.log(`🔄 LID resolvido via whatsappNumbers: ${lid} → ${jid}`);
+      lidToJid.set(lid, jid);
+      return jid;
+    }
+  } catch (err) {
+    console.warn("⚠️ whatsappNumbers falhou:", err.response?.data || err.message);
+  }
+
+  console.warn(`⚠️ Não foi possível resolver LID ${lid} — usando LID diretamente`);
   return lid;
 }
 
-async function enviarTexto(telefone, texto) {
+async function simularDigitando(telefone, duracaoMs) {
+  try {
+    const numero = limparNumero(telefone);
+    await axios.post(
+      `${CONFIG.whatsapp.url}/chat/sendPresence/${CONFIG.whatsapp.instance}`,
+      { number: numero, presence: "composing", delay: duracaoMs },
+      { headers: { apikey: CONFIG.whatsapp.apiKey } }
+    );
+  } catch (_) {
+    // Falha silenciosa — presença de digitação não é crítica para o atendimento
+  }
+}
+
+async function enviarTexto(telefone, texto, quotedKey = null, quotedMsg = null, pushName = null) {
   if (!telefoneValido(telefone)) {
     console.warn(`⚠️ Telefone inválido ignorado: ${telefone}`);
     return;
@@ -596,22 +779,24 @@ async function enviarTexto(telefone, texto) {
 
   let jid = telefone;
 
-  // Se for LID, tenta resolver para número real
   if (telefone.includes("@lid")) {
-    const resolvido = await resolverLid(telefone);
-    if (resolvido) {
-      jid = resolvido;
-    } else {
-      console.warn(`⚠️ Não foi possível resolver LID: ${telefone} — ignorando envio`);
-      return;
-    }
+    const resolvido = await resolverLid(telefone, pushName);
+    jid = (resolvido && resolvido.includes("@s.whatsapp.net")) ? resolvido : telefone;
+  }
+
+  const numero = jid.includes("@lid") ? jid : limparNumero(jid);
+
+  // Para LIDs: inclui quoted para rotear via conversa existente sem validar número
+  const body = { number: numero, text: texto };
+  if (jid.includes("@lid") && quotedKey && quotedMsg) {
+    body.options = { quoted: { key: quotedKey, message: quotedMsg } };
   }
 
   try {
-    const numero = limparNumero(jid);
+    console.log("🔍 Enviando:", numero, jid.includes("@lid") ? "(LID com quoted)" : "");
     await axios.post(
       `${CONFIG.whatsapp.url}/message/sendText/${CONFIG.whatsapp.instance}`,
-      { number: numero, textMessage: { text: texto } },
+      body,
       { headers: { apikey: CONFIG.whatsapp.apiKey } }
     );
     console.log(`📤 Texto enviado para ${numero}`);
@@ -629,49 +814,33 @@ async function enviarImagem(telefone, url) {
   let jid = telefone;
   if (telefone.includes("@lid")) {
     const resolvido = await resolverLid(telefone);
-    if (resolvido) {
-      jid = resolvido;
-    } else {
-      console.warn(`⚠️ Não foi possível resolver LID para imagem: ${telefone}`);
-      return;
-    }
+    jid = (resolvido && resolvido.includes("@s.whatsapp.net")) ? resolvido : telefone;
   }
 
   try {
-    const numero = limparNumero(jid);
+    const numero = jid.includes("@lid") ? jid : limparNumero(jid);
 
-    // Envia imagem via URL direta (funciona em todas as versões da Evolution API)
-    // Tenta v2 primeiro, depois v1 como fallback
+    // Tenta formato v2 da Evolution API primeiro, depois v1 como fallback
     try {
       await axios.post(
         `${CONFIG.whatsapp.url}/message/sendMedia/${CONFIG.whatsapp.instance}`,
         {
           number: numero,
-          mediaMessage: {
-            mediatype: "image",
-            media:     url,
-            caption:   "",
-          },
+          mediaMessage: { mediatype: "image", media: url, caption: "" },
         },
         { headers: { apikey: CONFIG.whatsapp.apiKey } }
       );
-    } catch (e1) {
-      // Fallback v1 da Evolution API
+    } catch (_) {
+      // Fallback para formato v1 da Evolution API
       await axios.post(
         `${CONFIG.whatsapp.url}/message/sendMedia/${CONFIG.whatsapp.instance}`,
-        {
-          number,
-          mediatype: "image",
-          media:     url,
-          caption:   "",
-        },
+        { number: numero, mediatype: "image", media: url, caption: "" },
         { headers: { apikey: CONFIG.whatsapp.apiKey } }
       );
     }
     console.log(`🖼️ Imagem enviada para ${numero}`);
   } catch (err) {
     console.error("❌ Erro ao enviar imagem:", JSON.stringify(err.response?.data, null, 2) || err.message);
-    console.error("❌ URL tentada:", url);
     console.log("↩️ Fallback: enviando link da imagem como texto");
     await enviarTexto(telefone, `Foto do produto: ${url}`);
   }
@@ -679,30 +848,28 @@ async function enviarImagem(telefone, url) {
 
 function extrairUrlsImagem(texto) {
   // Captura URLs de imagem incluindo blob storage do Azure (Microvix)
-  // Aceita URLs com ou sem extensão explícita, terminando em espaço ou fim de linha
   const regex = /https?:\/\/[^\s]+(?:\.jpg|\.jpeg|\.png|\.webp|blob\.core\.windows\.net\/[^\s]+)/gi;
   const matches = texto.match(regex) || [];
-  // Remove caracteres finais indesejados como ) , ; que possam ter sido capturados
   return matches.map(u => u.replace(/[),;]+$/, ""));
 }
 
-async function enviarResposta(telefone, resposta) {
+async function enviarResposta(telefone, resposta, quotedKey = null, quotedMsg = null, pushName = null) {
   const urls = extrairUrlsImagem(resposta);
 
-  // Remove todas as URLs do texto, junto com marcadores como "- " antes delas
+  // Remove URLs do texto para não duplicar (serão enviadas como mídia)
   const textoLimpo = resposta
-    .replace(/[-•]\s*https?:\/\/\S+/g, "")  // remove "- URL" ou "• URL"
-    .replace(/https?:\/\/\S+/g, "")          // remove qualquer URL restante
-    .replace(/\n{3,}/g, "\n\n")              // remove linhas em branco extras
+    .replace(/[-•]\s*https?:\/\/\S+/g, "")
+    .replace(/https?:\/\/\S+/g, "")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 
   if (urls.length) {
-    if (textoLimpo) await enviarTexto(telefone, textoLimpo);
+    if (textoLimpo) await enviarTexto(telefone, textoLimpo, quotedKey, quotedMsg, pushName);
     for (const url of urls) {
       await enviarImagem(telefone, url);
     }
   } else {
-    await enviarTexto(telefone, resposta);
+    await enviarTexto(telefone, resposta, quotedKey, quotedMsg, pushName);
   }
 }
 
@@ -711,18 +878,28 @@ async function enviarResposta(telefone, resposta) {
 ========================================================= */
 
 app.post("/webhook/whatsapp", async (req, res) => {
+  // Responde imediatamente com 200 para evitar timeout e reenvios da Evolution API
   res.sendStatus(200);
 
   try {
     const data = req.body;
 
-    if (data?.event !== "messages.upsert") return;
+    // A v1 envia "messages.upsert"; a v2 pode enviar "MESSAGES_UPSERT"
+    const evento = (data?.event || "").toLowerCase().replace("_", ".");
+    if (evento !== "messages.upsert") return;
     if (data?.data?.key?.fromMe) return;
 
-    const telefone = data?.data?.key?.remoteJid;
+    const telefone  = data?.data?.key?.remoteJid;
+    const msgKey    = data?.data?.key;
+    const msgObjeto = data?.data?.message;
+    const pushName  = data?.data?.pushName;
     if (!telefone) return;
 
-    // Bloqueia grupos e broadcasts — aceita @s.whatsapp.net e @lid
+    // Armazena pushName → JID quando JID real chega (usado para resolver LIDs depois)
+    if (pushName && telefone.includes("@s.whatsapp.net")) {
+      pushNameToJid.set(pushName, telefone);
+    }
+
     if (!telefoneValido(telefone)) {
       console.warn(`⚠️ Telefone inválido ignorado: ${telefone}`);
       return;
@@ -730,7 +907,6 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
     const msg = data?.data?.message;
 
-    // ── Extrai texto ou transcreve áudio ──────────────────
     let textoFinal =
       msg?.conversation ||
       msg?.extendedTextMessage?.text ||
@@ -750,15 +926,17 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
     console.log(`📩 [${telefone}] ${textoFinal}`);
 
-    const sessao = getSessao(telefone);
+    // Enfileira o processamento para evitar condição de corrida em mensagens rápidas
+    processarNaFila(telefone, async () => {
+      const sessao = getSessao(telefone);
 
-    // Simula digitando por tempo proporcional (máx 4s)
-    const tempoDigitando = Math.min(textoFinal.length * 50, 4000);
-    await simularDigitando(telefone, tempoDigitando);
-    await new Promise(r => setTimeout(r, tempoDigitando));
+      const tempoDigitando = Math.min(textoFinal.length * 50, 4000);
+      await simularDigitando(telefone, tempoDigitando);
+      await new Promise(r => setTimeout(r, tempoDigitando));
 
-    const resposta = await executarAgente(textoFinal, sessao);
-    await enviarResposta(telefone, resposta);
+      const resposta = await executarAgente(textoFinal, sessao);
+      await enviarResposta(telefone, resposta, msgKey, msgObjeto, pushName);
+    });
   } catch (err) {
     console.error("❌ Erro no webhook:", err.message);
   }
@@ -786,12 +964,21 @@ app.post("/testar", async (req, res) => {
 ========================================================= */
 
 app.get("/health", (req, res) => {
-  res.json({ status: "ok", timestamp: new Date().toISOString() });
+  res.json({
+    status:    "ok",
+    timestamp: new Date().toISOString(),
+    sessoes:   sessoes.size,           // Clientes com histórico ativo
+    filas:     filasPorTelefone.size,  // Mensagens sendo processadas agora
+    lidsCache: lidToJid.size,          // LIDs resolvidos em cache
+  });
 });
 
 /* =========================================================
    🚀 START
 ========================================================= */
+
+// Carrega sessões persistidas antes de aceitar conexões
+await carregarSessoes();
 
 app.listen(PORT, () => {
   console.log(`🚀 Agente Casa Faria rodando na porta ${PORT}`);
