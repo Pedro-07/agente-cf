@@ -1,15 +1,15 @@
 /**
  * Agente de IA para WhatsApp — Casa Faria Cohama
- * Stack: Node.js + Express + Anthropic API + Evolution API + Linx Microvix B2C
+ * Stack: Node.js + Express + Anthropic API + Z-API + Linx Microvix B2C
  *
  * Melhorias implementadas (v2):
  * - Fila de mensagens por telefone: evita condição de corrida no histórico
- * - Cache LID→JID: resolve LIDs sem bater na API toda vez
- * - Resolução de LID com 3 estratégias de fallback
  * - Persistência de sessões em arquivo JSON: histórico sobrevive a reinicializações
  * - Limite de histórico por sessão: evita crescimento ilimitado e custo excessivo
  * - Retry automático nas chamadas ao Microvix: maior resiliência a falhas transientes
  * - consultarImagensPorCodigo: agora filtra no ERP, não mais carrega tudo
+ * - Z-API: suporte nativo a LIDs sem resolução manual
+ * - Anti-ban: confirmação de leitura + jitter de timing + tempo mínimo de resposta
  */
 
 import express  from "express";
@@ -41,9 +41,18 @@ const CONFIG = {
     cnpj:    process.env.MICROVIX_CNPJ,
   },
   whatsapp: {
-    url:      process.env.EVOLUTION_API_URL,
-    apiKey:   process.env.EVOLUTION_API_KEY,
-    instance: process.env.EVOLUTION_INSTANCE,
+    instanceUrl: process.env.ZAPI_INSTANCE_URL,  // https://api.z-api.io/instances/{id}/token/{token}
+    clientToken: process.env.ZAPI_CLIENT_TOKEN,  // token de segurança do webhook (Z-API Security)
+  },
+  groq: {
+    apiKey: process.env.GROQ_API_KEY,  // transcrição de áudio via Whisper
+  },
+  equipe: {
+    numero:         process.env.NUMERO_EQUIPE,                       // número para ligar em urgências
+    grupo:          process.env.GRUPO_EQUIPE,                        // ID do grupo para notificações
+    adminToken:     process.env.ADMIN_TOKEN,                         // token para endpoints /admin/*
+    autoResumeHoras: parseInt(process.env.AUTO_RESUME_HORAS  || "0"), // 0 = desabilitado
+    alertaMinutos:   parseInt(process.env.ALERTA_SEM_ATENDIMENTO || "30"),
   },
   anthropic: {
     model: "claude-sonnet-4-20250514",
@@ -101,7 +110,7 @@ async function salvarSessoes() {
 
 function getSessao(telefone) {
   if (!sessoes.has(telefone)) {
-    sessoes.set(telefone, { historico: [], nome: null });
+    sessoes.set(telefone, { historico: [], nome: null, telefone, pausado: false });
   }
   return sessoes.get(telefone);
 }
@@ -117,7 +126,9 @@ function getSessao(telefone) {
    a anterior terminar antes de ser processada.
 ========================================================= */
 
-const filasPorTelefone = new Map();
+const filasPorTelefone   = new Map();
+const debouncePorTelefone = new Map();
+const DEBOUNCE_MS = 1500; // agrupa mensagens enviadas em sequência em até 1.5s
 
 function processarNaFila(telefone, fn) {
   // Pega a promise anterior ou resolve imediatamente se a fila estiver vazia
@@ -139,6 +150,17 @@ function processarNaFila(telefone, fn) {
   });
 
   return proxima;
+}
+
+/* =========================================================
+   🕐 HELPERS DE TEMPO (anti-ban)
+
+   Respostas instantâneas são um sinal claro de automação para o WhatsApp.
+   randomEntre() injeta jitter nos delays para imitar comportamento humano.
+========================================================= */
+
+function randomEntre(min, max) {
+  return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
 /* =========================================================
@@ -164,6 +186,29 @@ async function comRetry(fn, tentativas = 2, delayMs = 1000) {
 }
 
 /* =========================================================
+   💾 CACHE DE CONSULTAS EXTERNAS
+
+   Catálogo e imagens do Microvix raramente mudam — buscar o catálogo
+   inteiro a cada mensagem é desnecessário. Cache de 10 min elimina
+   a maioria das chamadas repetidas ao ERP.
+========================================================= */
+
+const cache = new Map();
+
+function cachePegar(chave) {
+  const entrada = cache.get(chave);
+  if (!entrada || Date.now() > entrada.expiraEm) {
+    cache.delete(chave);
+    return null;
+  }
+  return entrada.dados;
+}
+
+function cacheSalvar(chave, dados, ttlMs = 10 * 60 * 1000) {
+  cache.set(chave, { dados, expiraEm: Date.now() + ttlMs });
+}
+
+/* =========================================================
    📏 TRUNCAMENTO DE HISTÓRICO
 
    Problema resolvido: histórico crescia indefinidamente,
@@ -180,8 +225,16 @@ function truncarHistorico(historico) {
 
   let inicio = historico.length - max;
 
-  // Avança até encontrar uma mensagem "user" para não começar com "assistant"
-  while (inicio < historico.length && historico[inicio].role !== "user") {
+  // O histórico deve começar com uma mensagem "user" de texto puro.
+  // Mensagens user podem conter tool_result (retorno de ferramenta) —
+  // se o corte cair sobre um tool_result sem o tool_use anterior, a API rejeita.
+  while (inicio < historico.length) {
+    const msg = historico[inicio];
+    if (msg.role === "user") {
+      const isToolResult = Array.isArray(msg.content) &&
+        msg.content.some(c => c.type === "tool_result");
+      if (!isToolResult) break;
+    }
     inicio++;
   }
 
@@ -193,10 +246,22 @@ function truncarHistorico(historico) {
 ========================================================= */
 
 const NAO_SAO_NOMES = new Set([
-  "oi", "olá", "ola", "opa", "ei", "eai", "eaí", "alô", "alo",
-  "bom", "boa", "ok", "sim", "não", "nao", "fala", "hey", "hi",
-  "bora", "pode", "tem", "vai", "vem", "quer", "sou", "meu", "minha",
-  "pau", "bom", "dia", "tarde", "noite", "tudo", "bem", "certo",
+  // cumprimentos
+  "oi", "olá", "ola", "opa", "ei", "eai", "eaí", "alô", "alo", "hey", "hi",
+  // respostas curtas
+  "bom", "boa", "ok", "sim", "não", "nao", "bem", "certo", "tudo",
+  // verbos / pronomes
+  "fala", "bora", "pode", "tem", "vai", "vem", "quer", "sou", "meu", "minha",
+  "preciso", "quero", "tenho", "gostaria", "quanto", "qual", "como", "quando",
+  // horários / períodos
+  "dia", "tarde", "noite", "manha", "manhã",
+  // substantivos comuns que não são nomes de pessoas
+  "empresa", "cnpj", "produto", "preço", "preco", "estoque", "pedido",
+  "valor", "desconto", "entrega", "prazo", "loja", "compra", "orçamento",
+  // produtos (auto-capitalização no celular pode confundir)
+  "refrigerador", "freezer", "cervejeira", "fogão", "fogao", "forno",
+  "fritadeira", "balcão", "balcao", "vitrine", "geladeira", "buffet",
+  "batedeira", "amassadeira", "processador", "extrator",
 ]);
 
 function detectarNome(texto) {
@@ -289,16 +354,23 @@ function mapearColunas(responseData) {
 
 async function consultarProdutosPorNome(nomeProduto) {
   try {
-    // NOTA DE PERFORMANCE: B2CConsultaProdutos não suporta filtro por nome
-    // no servidor (API B2C do Microvix) — retorna o catálogo completo e
-    // filtramos localmente. Se o catálogo crescer muito (>500 produtos),
-    // considerar cache local com TTL de ~5 minutos para reduzir o tráfego.
-    const xml   = montarXml("B2CConsultaProdutos", [{ id: "timestamp", valor: "0" }]);
-    const json  = await chamarMicrovix(xml);
-    const todos = mapearColunas(json?.Microvix?.ResponseData);
+    // Catálogo completo em cache — evita buscar o ERP a cada mensagem.
+    // TTL de 10 min: suficiente para absorver picos, curto o bastante para pegar atualizações.
+    const CHAVE = "microvix:catalogo";
+    let todos = cachePegar(CHAVE);
+    if (!todos) {
+      const xml = montarXml("B2CConsultaProdutos", [{ id: "timestamp", valor: "0" }]);
+      const json = await chamarMicrovix(xml);
+      todos = mapearColunas(json?.Microvix?.ResponseData);
+      cacheSalvar(CHAVE, todos);
+      console.log(`📋 Catálogo carregado: ${todos.length} produtos`);
+    } else {
+      console.log(`📋 Catálogo via cache: ${todos.length} produtos`);
+    }
 
     const termo     = nomeProduto.toLowerCase();
     const filtrados = todos.filter(p => {
+      if (p.ativo !== "1" && p.ativo !== 1) return false;
       const nome = (p.nome_produto || p.descricao_basica || "").toLowerCase();
       const ref  = (p.referencia   || "").toLowerCase();
       return nome.includes(termo) || ref.includes(termo);
@@ -311,10 +383,8 @@ async function consultarProdutosPorNome(nomeProduto) {
     return {
       sucesso: true,
       produtos: filtrados.map(p => ({
-        codigo:     p.codigoproduto || "",
-        descricao:  p.nome_produto  || p.descricao_basica || "",
-        referencia: p.referencia    || "",
-        ativo:      p.ativo === "1" || p.ativo === 1,
+        codigo:    p.codigoproduto || "",
+        descricao: p.nome_produto  || p.descricao_basica || "",
       })),
     };
   } catch (err) {
@@ -332,16 +402,11 @@ async function consultarEstoquePorCodigo(codigoProduto) {
     const json  = await chamarMicrovix(xml);
     const itens = mapearColunas(json?.Microvix?.ResponseData);
 
-    if (!itens.length) return { sucesso: true, totalGeral: 0, estoque: [], mensagem: "Sem estoque." };
+    if (!itens.length) return { disponivel: false, quantidade: 0 };
 
-    const estoque    = itens.map(i => ({
-      empresa:    i.empresa    || "",
-      referencia: i.referencia || "",
-      quantidade: Number(i.saldo || 0),
-    }));
-    const totalGeral = estoque.reduce((acc, i) => acc + i.quantidade, 0);
+    const quantidade = itens.reduce((acc, i) => acc + Number(i.saldo || 0), 0);
 
-    return { sucesso: true, totalGeral, estoque };
+    return { disponivel: quantidade > 0, quantidade };
   } catch (err) {
     console.error("❌ consultarEstoquePorCodigo:", err.message);
     return { sucesso: false, erro: err.message };
@@ -362,11 +427,7 @@ async function consultarPrecoPorCodigo(codigoProduto) {
     const item = itens.reduce((max, i) =>
       Number(i.precovenda || 0) > Number(max.precovenda || 0) ? i : max, itens[0]);
 
-    return {
-      sucesso:     true,
-      precovenda:  Number(item.precovenda  || 0),
-      precominimo: Number(item.precominimo || 0),
-    };
+    return { precovenda: Number(item.precovenda || 0) };
   } catch (err) {
     console.error("❌ consultarPrecoPorCodigo:", err.message);
     return { sucesso: false, erro: err.message };
@@ -383,14 +444,12 @@ async function consultarPromocaoPorCodigo(codigoProduto) {
     const json  = await chamarMicrovix(xml);
     const itens = mapearColunas(json?.Microvix?.ResponseData);
 
-    if (!itens.length) return { sucesso: true, emPromocao: false };
+    if (!itens.length) return { emPromocao: false };
 
     const promo = itens[0];
     return {
-      sucesso:       true,
       emPromocao:    true,
       precoPromocao: Number(promo.preco || 0),
-      dataInicio:    promo.data_inicio  || "",
       dataTermino:   promo.data_termino || "",
     };
   } catch (err) {
@@ -401,15 +460,16 @@ async function consultarPromocaoPorCodigo(codigoProduto) {
 
 async function consultarImagensPorCodigo(codigoProduto) {
   try {
-    // MELHORIA: agora passa codigoproduto como parâmetro para filtrar no ERP.
-    // Versão anterior buscava as imagens de TODOS os produtos e filtrava em memória,
-    // gerando tráfego desnecessário para uma consulta simples de produto único.
-    const xml  = montarXml("B2CConsultaProdutosImagensURL", [
-      { id: "codigoproduto", valor: codigoProduto },
-      { id: "timestamp",     valor: "0" },
-    ]);
-    const json  = await chamarMicrovix(xml);
-    const itens = mapearColunas(json?.Microvix?.ResponseData);
+    // O endpoint não suporta filtro por produto — retorna tudo e filtramos localmente.
+    // Cache de 10 min para evitar recarregar o catálogo de imagens a cada consulta.
+    const CHAVE = "microvix:imagens";
+    let itens = cachePegar(CHAVE);
+    if (!itens) {
+      const xml = montarXml("B2CConsultaProdutosImagensURL", [{ id: "timestamp", valor: "0" }]);
+      const json = await chamarMicrovix(xml);
+      itens = mapearColunas(json?.Microvix?.ResponseData);
+      cacheSalvar(CHAVE, itens);
+    }
 
     // Filtro local mantido como segurança caso o ERP retorne produtos adjacentes
     const imagens = itens
@@ -440,9 +500,8 @@ async function consultarProdutosPorReferencia(referencia) {
     return {
       sucesso: true,
       produtos: produtos.map(p => ({
-        codigo:     p.codigoproduto || "",
-        descricao:  p.nome_produto  || p.descricao_basica || "",
-        referencia: p.referencia    || "",
+        codigo:    p.codigoproduto || "",
+        descricao: p.nome_produto  || p.descricao_basica || "",
       })),
     };
   } catch (err) {
@@ -518,6 +577,24 @@ const tools = [
     },
   },
   {
+    name: "chamar_atendente",
+    description:
+      "Chama um atendente humano para assumir a conversa. " +
+      "Use quando o cliente quiser fechar a compra, pedir atendimento humano, " +
+      "ou tiver dúvidas que você não consegue resolver. " +
+      "Após usar esta ferramenta, informe o cliente que o atendente foi notificado e pedirá aguardar.",
+    input_schema: {
+      type: "object",
+      properties: {
+        resumo: {
+          type: "string",
+          description: "Resumo para o atendente: produto(s), qtd, PJ ou PF, forma de pagamento, valor final calculado.",
+        },
+      },
+      required: ["resumo"],
+    },
+  },
+  {
     name: "consultar_produtos_por_referencia",
     description: "Busca produtos por código de referência alfanumérico.",
     input_schema: {
@@ -557,33 +634,53 @@ Maps: https://maps.app.goo.gl/NwW7nXYStV47q7FEA
 
 ## Descontos e condições
 CNPJ com IE ativa:
-- 20% à vista
+- 20% à vista (PIX ou dinheiro)
 - 13% no cartão, até 10x sem juros
 
 Pessoa física:
-- Compras > R$100: 5% à vista
-- Compras > R$1.000: 10% à vista
+- Compras > R$100: 5% à vista (PIX ou dinheiro)
+- Compras > R$1.000: 10% à vista (PIX ou dinheiro)
 - Parcelamento sem desconto:
   - Até R$499: 6x sem juros
   - Acima de R$499: 10x sem juros
 
+Não existem outros descontos, promoções ou condições além das listadas acima. Nunca sugira ou invente condições que não estão aqui.
+
 Entrega grátis: compras > R$500 na Grande Ilha (São Luís, São José de Ribamar, Raposa) em até 72h. Fora dessas cidades: apenas retirada na loja.
 
-Horário de funcionamento: de segunda à sexta, das 8 da manhã até 18h e aos sábados, das 8 até 16h
+Horário de funcionamento: de segunda à sexta, das 8h às 18h e aos sábados, das 8h às 16h.
+
+## Formas de pagamento
+- PIX: o atendente humano envia a chave PIX pelo próprio WhatsApp para o cliente pagar.
+- Cartão, dinheiro e boleto: apenas presencialmente na loja.
+- Não há link de pagamento, maquininha remota nem outra forma de pagamento à distância.
+
+## Como fechar uma venda
+Quando o cliente demonstrar interesse em comprar:
+1. Confirme o produto e a quantidade
+2. Pergunte se é PJ (CNPJ com IE) ou pessoa física — isso define o desconto
+3. Pergunte a forma de pagamento (PIX ou presencial)
+4. Assim que tiver produto + quantidade + PJ/PF + pagamento: PARE DE ESCREVER e execute a ferramenta chamar_atendente imediatamente
+5. Depois que a ferramenta retornar, escreva apenas: que o atendente foi notificado e vai entrar em contato em breve
+
+CRÍTICO — COMPORTAMENTO PROIBIDO:
+- NUNCA escreva "vou chamar um atendente", "estou transferindo", "aguarde que já vou transferir" ou qualquer variação disso SEM ter chamado a ferramenta chamar_atendente primeiro
+- NUNCA inclua no texto o resumo do pedido para o atendente — isso vai no campo "resumo" da ferramenta, não no texto ao cliente
+- Escrever sobre chamar o atendente SEM usar a ferramenta é um erro crítico: o cliente fica sem atendimento e ninguém é notificado
+- A ferramenta chamar_atendente é o ÚNICO mecanismo que realmente notifica a equipe. Texto não notifica ninguém.
 
 ## Como se comportar
-- Respostas curtas e diretas (máx. 4 linhas), estilo vendedor de loja física
+- Seja direto e vendedor — seu objetivo é fechar a venda, não só informar
+- Respostas curtas (máx. 3-4 linhas). Se tiver muito a dizer, quebre em mensagens menores
+- Nunca enrole ou repita o que o cliente já sabe
 - Máx. 1 emoji por mensagem, só se fizer sentido
-- Nunca use: "Perfeito!", "Ótimo!", "Excelente escolha!", "Com certeza!"
-- Varie a forma de cumprimentar ou responder; evite repetir
-- Respostas curtas possíveis: "Tem sim! Quer ver as opções?"
+- Nunca use: "Perfeito!", "Ótimo!", "Excelente escolha!", "Com certeza!", "Claro!"
 - Não use Markdown, negrito, itálico ou tachado
 - Produto disponível: - [nome] — R$ [preço] — [qtd] un.
-- Produtos com saldo zerado **não aparecem na lista de disponíveis**, mas mencione: "Esse produto está sem estoque no momento. Podemos consultar disponibilidade em outra unidade ou previsão de reposição."
-- Para fechar venda ou tirar dúvidas de entrega/prazo: chame atendente humano e resuma o que o cliente quer
+- Produto sem estoque: mencione que pode consultar previsão de reposição
 - Nunca invente informações; use só dados do ERP e deste prompt
-- sempre verificar o dia para poder informar o horário certo, caso alguém pergunte
-- Se mandarem mensagem fora do horário de atendimento, avise.
+- Verifique o dia atual para informar horário correto se perguntarem
+- Fora do horário de atendimento: avise e oriente a retornar no próximo dia útil
 - Sempre responda em português, com linguagem natural e amigável`;
 }
 
@@ -591,16 +688,21 @@ Horário de funcionamento: de segunda à sexta, das 8 da manhã até 18h e aos s
    🤖 MOTOR DO AGENTE
 ========================================================= */
 
-async function executarAgente(mensagem, sessao) {
-  if (!sessao.nome) {
-    const nomeDetectado = detectarNome(mensagem);
+// conteudo: string (texto) ou array de blocos (multimodal com imagem)
+async function executarAgente(conteudo, sessao) {
+  const textoPlano = typeof conteudo === "string"
+    ? conteudo
+    : conteudo.find(c => c.type === "text")?.text || "";
+
+  if (!sessao.nome && textoPlano) {
+    const nomeDetectado = detectarNome(textoPlano);
     if (nomeDetectado) {
       sessao.nome = nomeDetectado;
       console.log(`👤 Nome detectado: ${nomeDetectado}`);
     }
   }
 
-  sessao.historico.push({ role: "user", content: mensagem });
+  sessao.historico.push({ role: "user", content: conteudo });
 
   // Trunca o histórico antes de enviar para a API para controlar tokens e custo
   sessao.historico = truncarHistorico(sessao.historico);
@@ -653,6 +755,23 @@ async function executarAgente(mensagem, sessao) {
           case "consultar_produtos_por_referencia":
             resultado = await consultarProdutosPorReferencia(bloco.input.referencia);
             break;
+          case "chamar_atendente": {
+            sessao.pausado       = true;
+            sessao.pausadoEm     = Date.now();
+            sessao.alertaEnviado = false;
+            await salvarSessoes();
+            const destino = CONFIG.equipe.grupo || CONFIG.equipe.numero;
+            if (destino) {
+              const aviso =
+                `🔔 Atendimento solicitado\n` +
+                `Cliente: ${sessao.telefone}\n\n` +
+                `${bloco.input.resumo}\n\n` +
+                `Para retomar o bot: retomar ${sessao.telefone}`;
+              await enviarTexto(destino, aviso);
+            }
+            resultado = { notificado: true };
+            break;
+          }
           default:
             resultado = { erro: "Ferramenta desconhecida" };
         }
@@ -668,6 +787,19 @@ async function executarAgente(mensagem, sessao) {
     }
   }
 
+  // Remove blocos de imagem do histórico após a resposta — imagens em base64
+  // são grandes demais para manter em todas as chamadas subsequentes.
+  sessao.historico = sessao.historico.map(msg => {
+    if (msg.role === "user" && Array.isArray(msg.content)) {
+      const temImagem = msg.content.some(c => c.type === "image");
+      if (temImagem) {
+        const texto = msg.content.find(c => c.type === "text")?.text || "";
+        return { role: "user", content: texto ? `[imagem] ${texto}` : "[cliente enviou uma imagem]" };
+      }
+    }
+    return msg;
+  });
+
   // Persiste sessão após cada interação para sobreviver a reinicializações
   await salvarSessoes();
 
@@ -675,174 +807,106 @@ async function executarAgente(mensagem, sessao) {
 }
 
 /* =========================================================
-   📤 ENVIO VIA EVOLUTION API
-
-   ⚠️  PROBLEMA CONHECIDO: LIDs na Evolution API v1.8.7
-
-   O WhatsApp está migrando contatos de @s.whatsapp.net para
-   identificadores internos chamados LIDs (@lid). A v1.8.7 não
-   suporta envio para LIDs diretamente (retorna erro 400).
-
-   A v2.x da Evolution API suporta LID nativamente, mas não foi
-   possível conectar ao WhatsApp a partir de IPs de datacenter
-   (Railway, Oracle Cloud) — o handshake criptográfico do Baileys
-   é rejeitado nesses ambientes para novos registros. A v1 funcionou
-   porque a sessão foi autenticada via conexão residencial (ngrok).
-
-   Estratégia de resolução de LID implementada (3 etapas):
-   1. Cache local lidToJid — zero latência, sem chamada à API
-   2. POST /chat/findContacts com o LID como critério de busca
-   3. GET /chat/findContacts para buscar em todos os contatos armazenados
-   4. Fallback: tenta envio direto (vai falhar na v1.8.7, mas loga o erro)
-
-   O cache é populado sempre que um LID é resolvido com sucesso,
-   evitando chamadas repetidas à API para o mesmo contato.
+   🎙️ MÍDIA — download, transcrição e visão
 ========================================================= */
 
-// Cache em memória: LID (@lid) → JID real (@s.whatsapp.net)
-const lidToJid = new Map();
-
-// Cache em memória: pushName → JID real (@s.whatsapp.net)
-// Populado quando mensagens chegam com JID real — usado para resolver LIDs pelo nome
-const pushNameToJid = new Map();
-
-// Aceita @s.whatsapp.net e @lid — rejeita grupos (@g.us) e broadcasts
-function telefoneValido(telefone) {
-  return !!(telefone && !telefone.includes("@g.us") && !telefone.includes("@broadcast"));
+async function baixarBase64(url, mimeTypePadrao = "application/octet-stream") {
+  const res = await axios.get(url, { responseType: "arraybuffer", timeout: 20000 });
+  const buffer   = Buffer.from(res.data);
+  const mimeType = (res.headers["content-type"] || mimeTypePadrao).split(";")[0].trim();
+  return { base64: buffer.toString("base64"), mimeType, buffer };
 }
 
-function limparNumero(telefone) {
-  return telefone
-    .replace("@s.whatsapp.net", "")
-    .replace("@lid", "");
+async function transcreverAudio(audioUrl) {
+  const { buffer } = await baixarBase64(audioUrl);
+  const formData = new FormData();
+  formData.append("file", new Blob([buffer], { type: "audio/ogg" }), "audio.ogg");
+  formData.append("model", "whisper-large-v3-turbo");
+  formData.append("language", "pt");
+
+  const res = await fetch("https://api.groq.com/openai/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${CONFIG.groq.apiKey}` },
+    body: formData,
+  });
+
+  if (!res.ok) throw new Error(`Groq ${res.status}: ${await res.text()}`);
+  const data = await res.json();
+  return data.text?.trim() || "";
 }
 
-async function resolverLid(lid, pushName = null) {
-  // Cache local
-  if (lidToJid.has(lid)) {
-    console.log(`✅ LID resolvido via cache: ${lid} → ${lidToJid.get(lid)}`);
-    return lidToJid.get(lid);
-  }
+/* =========================================================
+   📤 ENVIO VIA Z-API
 
-  // Resolução via pushName — quando o contato já enviou mensagem com JID real antes
-  if (pushName && pushNameToJid.has(pushName)) {
-    const jid = pushNameToJid.get(pushName);
-    console.log(`🔄 LID resolvido via pushName "${pushName}": ${lid} → ${jid}`);
-    lidToJid.set(lid, jid);
-    return jid;
-  }
+   Z-API é um serviço gerenciado que abstrai o Baileys e resolve
+   LIDs internamente — sem necessidade de mapeamento manual.
 
-  // Tenta whatsappNumbers — endpoint que resolve LIDs para JIDs reais no v2
-  try {
-    const res = await axios.post(
-      `${CONFIG.whatsapp.url}/chat/whatsappNumbers/${CONFIG.whatsapp.instance}`,
-      { numbers: [lid] },
-      { headers: { apikey: CONFIG.whatsapp.apiKey, "Content-Type": "application/json" } }
-    );
-    console.log("🔍 whatsappNumbers retornou:", JSON.stringify(res.data, null, 2));
-
-    const lista = Array.isArray(res.data) ? res.data : [res.data];
-    const item  = lista.find(c => c?.jid?.includes("@s.whatsapp.net") || c?.exists);
-    const jid   = item?.jid;
-
-    if (jid && jid.includes("@s.whatsapp.net")) {
-      console.log(`🔄 LID resolvido via whatsappNumbers: ${lid} → ${jid}`);
-      lidToJid.set(lid, jid);
-      return jid;
-    }
-  } catch (err) {
-    console.warn("⚠️ whatsappNumbers falhou:", err.response?.data || err.message);
-  }
-
-  console.warn(`⚠️ Não foi possível resolver LID ${lid} — usando LID diretamente`);
-  return lid;
-}
+   Documentação: https://developer.z-api.io
+   Formato do número: apenas dígitos com DDI (ex: 5511999999999)
+========================================================= */
 
 async function simularDigitando(telefone, duracaoMs) {
   try {
-    const numero = limparNumero(telefone);
     await axios.post(
-      `${CONFIG.whatsapp.url}/chat/sendPresence/${CONFIG.whatsapp.instance}`,
-      { number: numero, presence: "composing", delay: duracaoMs },
-      { headers: { apikey: CONFIG.whatsapp.apiKey } }
+      `${CONFIG.whatsapp.instanceUrl}/send-chat-state`,
+      { phone: telefone, chatState: "composing" },
+      { headers: { "client-token": CONFIG.whatsapp.clientToken } }
     );
   } catch (_) {
     // Falha silenciosa — presença de digitação não é crítica para o atendimento
   }
 }
 
-async function enviarTexto(telefone, texto, quotedKey = null, quotedMsg = null, pushName = null) {
-  if (!telefoneValido(telefone)) {
-    console.warn(`⚠️ Telefone inválido ignorado: ${telefone}`);
-    return;
-  }
-
-  let jid = telefone;
-
-  if (telefone.includes("@lid")) {
-    const resolvido = await resolverLid(telefone, pushName);
-    jid = (resolvido && resolvido.includes("@s.whatsapp.net")) ? resolvido : telefone;
-  }
-
-  const numero = jid.includes("@lid") ? jid : limparNumero(jid);
-
-  // Para LIDs: inclui quoted para rotear via conversa existente sem validar número
-  const body = { number: numero, text: texto };
-  if (jid.includes("@lid") && quotedKey && quotedMsg) {
-    body.options = { quoted: { key: quotedKey, message: quotedMsg } };
-  }
-
+async function enviarTexto(telefone, texto) {
   try {
-    console.log("🔍 Enviando:", numero, jid.includes("@lid") ? "(LID com quoted)" : "");
     await axios.post(
-      `${CONFIG.whatsapp.url}/message/sendText/${CONFIG.whatsapp.instance}`,
-      body,
-      { headers: { apikey: CONFIG.whatsapp.apiKey } }
+      `${CONFIG.whatsapp.instanceUrl}/send-text`,
+      { phone: telefone, message: texto },
+      { headers: { "client-token": CONFIG.whatsapp.clientToken } }
     );
-    console.log(`📤 Texto enviado para ${numero}`);
+    console.log(`📤 Texto enviado para ${telefone}`);
   } catch (err) {
     console.error("❌ Erro ao enviar texto:", JSON.stringify(err.response?.data, null, 2) || err.message);
   }
 }
 
 async function enviarImagem(telefone, url) {
-  if (!telefoneValido(telefone)) {
-    console.warn(`⚠️ Telefone inválido ignorado: ${telefone}`);
-    return;
-  }
-
-  let jid = telefone;
-  if (telefone.includes("@lid")) {
-    const resolvido = await resolverLid(telefone);
-    jid = (resolvido && resolvido.includes("@s.whatsapp.net")) ? resolvido : telefone;
-  }
-
   try {
-    const numero = jid.includes("@lid") ? jid : limparNumero(jid);
-
-    // Tenta formato v2 da Evolution API primeiro, depois v1 como fallback
-    try {
-      await axios.post(
-        `${CONFIG.whatsapp.url}/message/sendMedia/${CONFIG.whatsapp.instance}`,
-        {
-          number: numero,
-          mediaMessage: { mediatype: "image", media: url, caption: "" },
-        },
-        { headers: { apikey: CONFIG.whatsapp.apiKey } }
-      );
-    } catch (_) {
-      // Fallback para formato v1 da Evolution API
-      await axios.post(
-        `${CONFIG.whatsapp.url}/message/sendMedia/${CONFIG.whatsapp.instance}`,
-        { number: numero, mediatype: "image", media: url, caption: "" },
-        { headers: { apikey: CONFIG.whatsapp.apiKey } }
-      );
-    }
-    console.log(`🖼️ Imagem enviada para ${numero}`);
+    await axios.post(
+      `${CONFIG.whatsapp.instanceUrl}/send-image`,
+      { phone: telefone, image: url, caption: "" },
+      { headers: { "client-token": CONFIG.whatsapp.clientToken } }
+    );
+    console.log(`🖼️ Imagem enviada para ${telefone}`);
   } catch (err) {
     console.error("❌ Erro ao enviar imagem:", JSON.stringify(err.response?.data, null, 2) || err.message);
-    console.log("↩️ Fallback: enviando link da imagem como texto");
     await enviarTexto(telefone, `Foto do produto: ${url}`);
+  }
+}
+
+async function ligarParaAtendente(numero) {
+  try {
+    await axios.post(
+      `${CONFIG.whatsapp.instanceUrl}/start-call`,
+      { phone: numero, isVideo: false },
+      { headers: { "client-token": CONFIG.whatsapp.clientToken } }
+    );
+    console.log(`📞 Ligação iniciada para ${numero}`);
+  } catch (err) {
+    console.warn("⚠️ Falha ao ligar para atendente:", err.response?.data || err.message);
+  }
+}
+
+async function marcarLida(telefone, messageId) {
+  if (!messageId) return;
+  try {
+    await axios.post(
+      `${CONFIG.whatsapp.instanceUrl}/read-message`,
+      { phone: telefone, messageId },
+      { headers: { "client-token": CONFIG.whatsapp.clientToken } }
+    );
+  } catch (_) {
+    // Falha silenciosa — confirmação de leitura não é crítica
   }
 }
 
@@ -853,7 +917,7 @@ function extrairUrlsImagem(texto) {
   return matches.map(u => u.replace(/[),;]+$/, ""));
 }
 
-async function enviarResposta(telefone, resposta, quotedKey = null, quotedMsg = null, pushName = null) {
+async function enviarResposta(telefone, resposta) {
   const urls = extrairUrlsImagem(resposta);
 
   // Remove URLs do texto para não duplicar (serão enviadas como mídia)
@@ -864,12 +928,12 @@ async function enviarResposta(telefone, resposta, quotedKey = null, quotedMsg = 
     .trim();
 
   if (urls.length) {
-    if (textoLimpo) await enviarTexto(telefone, textoLimpo, quotedKey, quotedMsg, pushName);
+    if (textoLimpo) await enviarTexto(telefone, textoLimpo);
     for (const url of urls) {
       await enviarImagem(telefone, url);
     }
   } else {
-    await enviarTexto(telefone, resposta, quotedKey, quotedMsg, pushName);
+    await enviarTexto(telefone, resposta);
   }
 }
 
@@ -878,68 +942,240 @@ async function enviarResposta(telefone, resposta, quotedKey = null, quotedMsg = 
 ========================================================= */
 
 app.post("/webhook/whatsapp", async (req, res) => {
-  // Responde imediatamente com 200 para evitar timeout e reenvios da Evolution API
+  // Responde imediatamente com 200 para evitar timeout e reenvios da Z-API
   res.sendStatus(200);
 
   try {
     const data = req.body;
 
-    // A v1 envia "messages.upsert"; a v2 pode enviar "MESSAGES_UPSERT"
-    const evento = (data?.event || "").toLowerCase().replace("_", ".");
-    if (evento !== "messages.upsert") return;
-    if (data?.data?.key?.fromMe) return;
+    // Z-API: só processa mensagens recebidas, ignora grupos e newsletters
+    if (data?.type !== "ReceivedCallback") return;
+    if (data?.isGroup) return;
+    if (data?.isNewsletter) return;
+    if (String(data?.phone || "").includes("@newsletter")) return;
 
-    const telefone  = data?.data?.key?.remoteJid;
-    const msgKey    = data?.data?.key;
-    const msgObjeto = data?.data?.message;
-    const pushName  = data?.data?.pushName;
-    if (!telefone) return;
-
-    // Armazena pushName → JID quando JID real chega (usado para resolver LIDs depois)
-    if (pushName && telefone.includes("@s.whatsapp.net")) {
-      pushNameToJid.set(pushName, telefone);
-    }
-
-    if (!telefoneValido(telefone)) {
-      console.warn(`⚠️ Telefone inválido ignorado: ${telefone}`);
+    // Mensagem enviada pelo próprio atendente (fromMe): detecta encerramento de atendimento
+    if (data?.fromMe) {
+      const texto = (data?.text?.message || "").toLowerCase();
+      if (texto.includes("atendimento encerrado")) {
+        const telefone = data?.phone;
+        const sessao   = telefone && sessoes.get(telefone);
+        if (sessao?.pausado) {
+          sessao.pausado       = false;
+          sessao.pausadoEm     = null;
+          sessao.alertaEnviado = false;
+          await salvarSessoes();
+          console.log(`▶️  [${telefone}] Bot retomado — atendimento encerrado pelo atendente`);
+        }
+      }
       return;
     }
 
-    const msg = data?.data?.message;
+    const telefone = data?.phone;
+    if (!telefone) return;
 
-    let textoFinal =
-      msg?.conversation ||
-      msg?.extendedTextMessage?.text ||
-      msg?.imageMessage?.caption || "";
+    // Comandos da equipe via WhatsApp — processa antes de qualquer outra lógica
+    if (CONFIG.equipe.numero && telefone === CONFIG.equipe.numero) {
+      const cmd = (data?.text?.message || "").trim();
+      if (cmd.toLowerCase().startsWith("retomar ")) {
+        const tel = cmd.split(" ")[1]?.trim();
+        const s   = tel && sessoes.get(tel);
+        if (s) {
+          s.pausado = false; s.pausadoEm = null; s.alertaEnviado = false;
+          await salvarSessoes();
+          await enviarTexto(CONFIG.equipe.numero, `✅ Bot retomado para ${tel}`);
+          console.log(`▶️  Bot retomado via comando para ${tel}`);
+        } else {
+          await enviarTexto(CONFIG.equipe.numero, `❌ Número não encontrado: ${tel}`);
+        }
+      }
+      return; // Mensagens da equipe não são processadas como atendimento
+    }
 
-    if (!textoFinal.trim()) {
-      const isAudio = !!(msg?.audioMessage || msg?.pttMessage);
-
-      if (isAudio) {
-        console.log("🎙️ Áudio recebido de", telefone, "— solicitando texto");
-        await enviarTexto(telefone, "Por enquanto só consigo responder mensagens de texto. Pode digitar sua dúvida?");
+    // Bot pausado: verifica auto-retomada por tempo antes de ignorar
+    const sessaoPausada = sessoes.get(telefone);
+    if (sessaoPausada?.pausado) {
+      const autoResumeMs = CONFIG.equipe.autoResumeHoras * 60 * 60 * 1000;
+      const inativoHa    = Date.now() - (sessaoPausada.pausadoEm || 0);
+      if (autoResumeMs > 0 && inativoHa >= autoResumeMs) {
+        sessaoPausada.pausado = false;
+        sessaoPausada.pausadoEm = null;
+        await salvarSessoes();
+        console.log(`▶️  [${telefone}] Auto-retomado após ${(inativoHa / 3600000).toFixed(1)}h`);
+        // Continua o processamento normalmente
+      } else {
+        console.log(`⏸️  [${telefone}] Bot pausado — mensagem ignorada`);
         return;
       }
     }
 
+    // ── Áudio / PTT ──────────────────────────────────────────────
+    const audioUrl = data?.audio?.audioUrl || data?.ptt?.pttUrl;
+    if (audioUrl) {
+      const audioMsgId = data?.messageId;
+      console.log(`🎙️ [${telefone}] Áudio recebido — transcrevendo...`);
+      processarNaFila(telefone, async () => {
+        try {
+          const inicioMs = Date.now();
+          await new Promise(r => setTimeout(r, randomEntre(500, 1200)));
+          await marcarLida(telefone, audioMsgId);
+          const transcricao = await transcreverAudio(audioUrl);
+          if (!transcricao) return;
+          console.log(`🎙️ [${telefone}] Transcrito: ${transcricao}`);
+          const sessao = getSessao(telefone);
+          const tempoDigitando = Math.floor(randomEntre(1800, 3000));
+          await simularDigitando(telefone, tempoDigitando);
+          await new Promise(r => setTimeout(r, tempoDigitando));
+          const resposta = await executarAgente(transcricao, sessao);
+          const decorrido = Date.now() - inicioMs;
+          if (decorrido < 3000) await new Promise(r => setTimeout(r, 3000 - decorrido));
+          await enviarResposta(telefone, resposta);
+        } catch (err) {
+          console.error("❌ Erro ao transcrever áudio:", err.message);
+          await enviarTexto(telefone, "Não consegui entender o áudio. Pode digitar sua mensagem?");
+        }
+      });
+      return;
+    }
+
+    // ── Imagem ────────────────────────────────────────────────────
+    const imagemUrl = data?.image?.imageUrl;
+    if (imagemUrl) {
+      const imagemMsgId = data?.messageId;
+      const caption = data?.image?.caption || "";
+      console.log(`🖼️ [${telefone}] Imagem recebida${caption ? ` — legenda: ${caption}` : ""}`);
+      processarNaFila(telefone, async () => {
+        try {
+          const inicioMs = Date.now();
+          await new Promise(r => setTimeout(r, randomEntre(500, 1200)));
+          await marcarLida(telefone, imagemMsgId);
+          const { base64, mimeType } = await baixarBase64(imagemUrl, "image/jpeg");
+          const tipoValido = ["image/jpeg", "image/png", "image/gif", "image/webp"].includes(mimeType)
+            ? mimeType : "image/jpeg";
+          const conteudo = [
+            { type: "image", source: { type: "base64", media_type: tipoValido, data: base64 } },
+            { type: "text", text: caption || "O cliente enviou esta imagem. Analise e responda conforme o contexto." },
+          ];
+          const sessao = getSessao(telefone);
+          const tempoDigitando = Math.floor(randomEntre(1800, 3000));
+          await simularDigitando(telefone, tempoDigitando);
+          await new Promise(r => setTimeout(r, tempoDigitando));
+          const resposta = await executarAgente(conteudo, sessao);
+          const decorrido = Date.now() - inicioMs;
+          if (decorrido < 3000) await new Promise(r => setTimeout(r, 3000 - decorrido));
+          await enviarResposta(telefone, resposta);
+        } catch (err) {
+          console.error("❌ Erro ao processar imagem:", err.message);
+          await enviarTexto(telefone, "Não consegui analisar a imagem. Pode descrever o que precisa?");
+        }
+      });
+      return;
+    }
+
+    // ── Texto ─────────────────────────────────────────────────────
+    const textoFinal = data?.text?.message || data?.video?.caption || "";
     if (!textoFinal.trim()) return;
 
     console.log(`📩 [${telefone}] ${textoFinal}`);
 
-    // Enfileira o processamento para evitar condição de corrida em mensagens rápidas
-    processarNaFila(telefone, async () => {
-      const sessao = getSessao(telefone);
+    // Reset de conversa: cliente digita palavra-chave para limpar o histórico
+    const RESET_KEYWORDS = ["nova conversa", "reiniciar", "resetar", "/reset", "limpar"];
+    if (RESET_KEYWORDS.some(k => textoFinal.toLowerCase().includes(k))) {
+      sessoes.delete(telefone);
+      await salvarSessoes();
+      await enviarTexto(telefone, "Conversa reiniciada! Como posso ajudar?");
+      return;
+    }
 
-      const tempoDigitando = Math.min(textoFinal.length * 50, 4000);
-      await simularDigitando(telefone, tempoDigitando);
-      await new Promise(r => setTimeout(r, tempoDigitando));
+    // Debounce: agrupa mensagens enviadas em sequência rápida numa única chamada ao agente,
+    // evitando múltiplas respostas e desperdício de créditos da API.
+    // messageId: guarda o ID da última mensagem recebida para marcar como lida.
+    const estado = debouncePorTelefone.get(telefone) || { mensagens: [] };
+    estado.mensagens.push(textoFinal);
+    estado.messageId = data?.messageId; // sobrescreve com o ID mais recente do lote
+    if (estado.timer) clearTimeout(estado.timer);
 
-      const resposta = await executarAgente(textoFinal, sessao);
-      await enviarResposta(telefone, resposta, msgKey, msgObjeto, pushName);
-    });
+    estado.timer = setTimeout(() => {
+      debouncePorTelefone.delete(telefone);
+      const textoAgrupado = estado.mensagens.join("\n");
+      const msgId         = estado.messageId;
+
+      processarNaFila(telefone, async () => {
+        const inicioMs = Date.now();
+        const sessao   = getSessao(telefone);
+
+        // 1. Pausa curta antes de marcar como lido (imita humano lendo)
+        await new Promise(r => setTimeout(r, randomEntre(500, 1200)));
+        await marcarLida(telefone, msgId);
+
+        // 2. Indica "digitando" com duração proporcional ao texto + jitter ±25%
+        const baseDigitando = Math.min(textoAgrupado.length * 50, 4000);
+        const tempoDigitando = Math.floor(baseDigitando * randomEntre(75, 125) / 100);
+        await simularDigitando(telefone, tempoDigitando);
+        await new Promise(r => setTimeout(r, tempoDigitando));
+
+        // 3. Processa resposta
+        const resposta = await executarAgente(textoAgrupado, sessao);
+
+        // 4. Garante tempo mínimo de 3s desde o recebimento (evita resposta instantânea)
+        const decorrido = Date.now() - inicioMs;
+        if (decorrido < 3000) {
+          await new Promise(r => setTimeout(r, 3000 - decorrido));
+        }
+
+        await enviarResposta(telefone, resposta);
+      });
+    }, DEBOUNCE_MS);
+
+    debouncePorTelefone.set(telefone, estado);
   } catch (err) {
     console.error("❌ Erro no webhook:", err.message);
   }
+});
+
+/* =========================================================
+   🛠️  ROTAS DE ADMINISTRAÇÃO
+========================================================= */
+
+function autenticarAdmin(req, res) {
+  const token = req.headers["x-admin-token"];
+  if (CONFIG.equipe.adminToken && token !== CONFIG.equipe.adminToken) {
+    res.status(401).json({ erro: "Token inválido" });
+    return false;
+  }
+  return true;
+}
+
+// Pausa o bot para um número — atendente humano assume
+app.post("/admin/pausar/:telefone", async (req, res) => {
+  if (!autenticarAdmin(req, res)) return;
+  const sessao = getSessao(req.params.telefone);
+  sessao.pausado = true;
+  await salvarSessoes();
+  console.log(`⏸️  Bot pausado para ${req.params.telefone}`);
+  res.json({ pausado: true, telefone: req.params.telefone });
+});
+
+// Retoma o bot para um número — atendente humano encerrou
+app.post("/admin/retomar/:telefone", async (req, res) => {
+  if (!autenticarAdmin(req, res)) return;
+  const sessao = getSessao(req.params.telefone);
+  sessao.pausado = false;
+  await salvarSessoes();
+  console.log(`▶️  Bot retomado para ${req.params.telefone}`);
+  res.json({ pausado: false, telefone: req.params.telefone });
+});
+
+// Lista conversas ativas e pausadas
+app.get("/admin/sessoes", (req, res) => {
+  if (!autenticarAdmin(req, res)) return;
+  const lista = [...sessoes.entries()].map(([tel, s]) => ({
+    telefone: tel,
+    nome:     s.nome || null,
+    pausado:  s.pausado || false,
+    mensagens: s.historico.length,
+  }));
+  res.json(lista);
 });
 
 /* =========================================================
@@ -969,7 +1205,6 @@ app.get("/health", (req, res) => {
     timestamp: new Date().toISOString(),
     sessoes:   sessoes.size,           // Clientes com histórico ativo
     filas:     filasPorTelefone.size,  // Mensagens sendo processadas agora
-    lidsCache: lidToJid.size,          // LIDs resolvidos em cache
   });
 });
 
@@ -979,6 +1214,51 @@ app.get("/health", (req, res) => {
 
 // Carrega sessões persistidas antes de aceitar conexões
 await carregarSessoes();
+
+/* =========================================================
+   ⏱️  VIGILÂNCIA DE ATENDIMENTOS PAUSADOS
+
+   Verifica a cada minuto se há clientes esperando atendimento
+   humano há mais de ALERTA_SEM_ATENDIMENTO minutos.
+   Se sim: avisa o cliente, dispara alerta urgente no grupo
+   e liga para o número do atendente.
+========================================================= */
+setInterval(async () => {
+  const limiteMs = CONFIG.equipe.alertaMinutos * 60 * 1000;
+  if (!limiteMs) return;
+
+  for (const [telefone, sessao] of sessoes.entries()) {
+    if (!sessao.pausado || !sessao.pausadoEm || sessao.alertaEnviado) continue;
+
+    const esperandoHa = Date.now() - sessao.pausadoEm;
+    if (esperandoHa < limiteMs) continue;
+
+    console.log(`⚠️  [${telefone}] Sem atendimento há ${Math.round(esperandoHa / 60000)}min — disparando alerta`);
+    sessao.alertaEnviado = true;
+    await salvarSessoes();
+
+    // Mensagem de desculpas ao cliente
+    await enviarTexto(telefone,
+      "Peço desculpas pela espera! Estamos com alto volume de atendimentos no momento. " +
+      "Seu contato é importante para nós e um atendente entrará em contato em breve."
+    );
+
+    // Alerta urgente no grupo ou número da equipe
+    const destino = CONFIG.equipe.grupo || CONFIG.equipe.numero;
+    if (destino) {
+      await enviarTexto(destino,
+        `🚨 URGENTE — Cliente aguardando há ${Math.round(esperandoHa / 60000)} minutos!\n` +
+        `Cliente: ${telefone}\n\n` +
+        `Para retomar o bot: retomar ${telefone}`
+      );
+    }
+
+    // Liga para o atendente
+    if (CONFIG.equipe.numero) {
+      await ligarParaAtendente(CONFIG.equipe.numero);
+    }
+  }
+}, 60 * 1000);
 
 app.listen(PORT, () => {
   console.log(`🚀 Agente Casa Faria rodando na porta ${PORT}`);
