@@ -1,7 +1,7 @@
 # Notas do Projeto — Agente IA Casa Faria Cohama
 
 > Arquivo de anotações técnicas para uso interno (Claude Code).
-> Atualizado em: 2026-03-20
+> Atualizado em: 2026-03-21
 
 ---
 
@@ -30,9 +30,11 @@ Z-API → POST /webhook/whatsapp
     │
     ▼
 server.js
+    ├── rate limit (15 chamadas/hora por número)
     ├── debounce (1500ms) — agrupa mensagens rápidas
     ├── fila por telefone — evita condição de corrida
     ├── anti-ban (leitura + jitter + tempo mínimo)
+    ├── verificarHorarioFuncionamento() — injeta contexto no prompt
     ├── executarAgente() — loop até 10 iterações
     │       ├── Claude API (tool_use / end_turn)
     │       └── tool dispatch → Microvix API calls
@@ -52,6 +54,7 @@ Campos por sessão: `historico`, `nome`, `telefone`, `pausado`, `pausadoEm`, `al
 - [x] System prompt completo com regras de venda, descontos PJ/PF, horários, entrega
 - [x] Detecção de nome do cliente (`detectarNome`) com lista `NAO_SAO_NOMES` para evitar falsos positivos
 - [x] Truncamento de histórico (`truncarHistorico`) com fix para evitar `tool_result` órfão no início
+- [x] Identidade da Fari — agente se apresenta como "Fari, atendente virtual da Casa Faria" na primeira mensagem de cada conversa
 
 ### 3.2 WhatsApp (Z-API)
 - [x] Migração de Evolution API → Z-API (motivação: Evolution API v2.2.3 não suporta LIDs nativamente)
@@ -82,12 +85,14 @@ Campos por sessão: `historico`, `nome`, `telefone`, `pausado`, `pausadoEm`, `al
 
 ### 3.8 Handoff humano
 - [x] Ferramenta `chamar_atendente` — pausa bot, notifica grupo/número da equipe
+- [x] Notificação ao grupo inclui: número do cliente, link wa.me clicável, nome (se detectado), resumo formatado
 - [x] Sessão marcada `pausado: true` + `pausadoEm: timestamp`
 - [x] Retomada automática por tempo (`AUTO_RESUME_HORAS`, padrão: 4h)
 - [x] Retomada via palavra-chave no fromMe: texto contendo "atendimento encerrado"
 - [x] Retomada via comando da equipe: atendente envia "retomar XXXXXXXXXX" no WhatsApp
 - [x] Retomada via endpoint admin: `POST /admin/retomar/:telefone`
 - [x] Timer de vigilância (`setInterval` a cada 1min) — após `ALERTA_SEM_ATENDIMENTO` minutos (padrão: 30min) sem atendimento: envia desculpas ao cliente, alerta urgente no grupo, liga para `NUMERO_EQUIPE`
+- [x] Após handoff, mensagem ao cliente informa **quando** o vendedor vai retornar (calculado dinamicamente: "segunda-feira às 8h", "amanhã às 8h", etc.)
 
 ### 3.9 Anti-ban
 - [x] `randomEntre(min, max)` — helper de jitter
@@ -109,66 +114,75 @@ Campos por sessão: `historico`, `nome`, `telefone`, `pausado`, `pausadoEm`, `al
 ### 3.12 Retry
 - [x] `comRetry(fn, tentativas=2, delayMs=1000)` — backoff linear nas chamadas ao Microvix
 
+### 3.13 Horário de funcionamento inteligente
+- [x] `verificarHorarioFuncionamento()` — calcula se está dentro do expediente (Seg–Sex 8h–18h, Sáb 8h–16h, timezone `America/Sao_Paulo`)
+- [x] Fora do horário: Claude continua atendendo normalmente (não bloqueia), recebe contexto no system prompt informando que está fechado e quando reabre
+- [x] Fari avisa o cliente na primeira mensagem fora do horário, mas responde dúvidas, consulta produtos, preços e estoque normalmente
+- [x] Se cliente virar lead qualificado fora do horário: `chamar_atendente` é chamado normalmente e mensagem ao cliente informa o próximo horário de atendimento
+- [x] `proximoAtendimento` calculado dinamicamente: "hoje às 8h", "amanhã às 8h", "segunda-feira às 8h" etc.
+
+### 3.14 Rate limiting
+- [x] `incrementarRateLimit(telefone)` — janela deslizante de 1 hora, limite de 15 chamadas ao Claude por número
+- [x] Ao atingir o limite: avisa o cliente ("Recebi muitas mensagens... vou passar para um atendente"), notifica o grupo da equipe, pausa o bot para aquele número
+- [x] Mensagem ao cliente inclui quando o atendente vai retornar (usa `proximoAtendimento` do horário atual)
+- [x] Janela reseta automaticamente após 1 hora
+
+### 3.15 Detecção de nomes — melhorias
+- [x] Adicionados verbos imperativos à `NAO_SAO_NOMES`: "manda", "passa", "faz", "traz", "liga", "chama", "diz", "dá" (evita falsos positivos como "Manda a loc")
+
 ---
 
-## 4. BUGS CONHECIDOS / PROBLEMAS PENDENTES
+## 4. EM TESTE
 
-### 🔴 CRÍTICO — chamar_atendente não está sendo chamado como tool_use
+- **Identidade Fari** — apresentação na primeira mensagem, comportamento fora do horário comercial
+- **Horário fora do expediente** — Fari atendendo e informando corretamente quando o vendedor vai retornar
+- **Rate limiting** — limite de 15 chamadas/hora com handoff automático ao atingir o limite
+- **Notificação ao atendente** — formato enriquecido com wa.me e nome do cliente
 
-**Sintoma:** Claude escreve a mensagem de handoff em texto ("Vou chamar um atendente...") sem executar a ferramenta `chamar_atendente`. O bot não pausa, o grupo não é notificado, nenhum atendente sabe do pedido.
+---
 
-**Causa raiz:** Claude está fazendo `end_turn` com texto descritivo em vez de `tool_use`. É um problema de alinhamento do prompt — o modelo interpreta a instrução como informação a comunicar ao cliente, não como gatilho obrigatório de ferramenta.
+## 5. BUGS CONHECIDOS
 
-**O que já foi tentado:**
-1. Adicionado "USE IMEDIATAMENTE a ferramenta chamar_atendente" no prompt
-2. Adicionado "REGRA ABSOLUTA: nunca escreva sem chamar a ferramenta"
-3. Adicionado "CRÍTICO — COMPORTAMENTO PROIBIDO" com exemplos explícitos do que não fazer
-4. Adicionado "NUNCA inclua o resumo para o atendente no texto ao cliente"
-
-**Nenhuma das tentativas resolveu ainda.**
-
-**Próximos passos para investigar:**
-- Opção A: Usar `tool_choice: { type: "auto" }` explícito + reformular o prompt como condição imperativa mais simples ("Se cliente confirmou X, Y, Z → use chamar_atendente")
-- Opção B: Remover o step-by-step numérico do prompt e substituir por uma regra condicional clara: "Quando [condição] → chamar_atendente. Ponto."
-- Opção C: Detectar no código quando Claude menciona "atendente" ou "PIX" no texto sem ter chamado a ferramenta, e forçar nova iteração com mensagem de sistema instruindo a usar a ferramenta
-- Opção D: Adicionar `tool_choice: { type: "required" }` apenas quando a sessão estiver em estado "aguardando fechamento" (requer detecção de estado no código)
-
-**Recomendação:** Tentar Opção B primeiro (prompt mais simples e direto), depois Opção C (detecção no código como fallback).
+### ✅ RESOLVIDO — chamar_atendente não estava sendo chamado como tool_use
+Confirmado funcionando em 2026-03-21 nos logs de produção. Claude chama a ferramenta corretamente ao detectar intenção de compra com produto + quantidade + PJ/PF + pagamento.
 
 ### 🟡 MÉDIO — Conta Z-API em trial
-
-**Sintoma:** Todas as mensagens enviadas chegam com prefixo "ESTA MENSAGEM FOI ENVIADA POR UMA CONTA EM TRIAL". Impossível distinguir se o bot está funcionando corretamente em produção real.
-
-**Solução:** Assinar um plano pago da Z-API. Sem isso, o agente não pode ser usado com clientes reais.
+**Sintoma:** Todas as mensagens enviadas chegam com prefixo "ESTA MENSAGEM FOI ENVIADA POR UMA CONTA EM TRIAL".
+**Solução:** Assinar um plano pago da Z-API.
 
 ---
 
-## 5. O QUE PRECISA SER FEITO
+## 6. O QUE PRECISA SER FEITO
 
 ### 🔴 Alta prioridade
 
-- [ ] **Resolver bug do chamar_atendente** (ver seção 4 acima)
-- [ ] **Assinar Z-API** para remover mensagens de trial
+- [ ] **Assinar Z-API** para remover mensagens de trial — sem isso o agente não pode ser usado com clientes reais
 
 ### 🟡 Média prioridade
 
-- [ ] **Horário de funcionamento no código** — atualmente só no prompt. O código deveria verificar o horário e rejeitar mensagens fora do expediente com resposta automática, sem gastar tokens da API Anthropic. Horário: Seg-Sex 8h–18h, Sáb 8h–16h. Considerar timezone `America/Sao_Paulo`.
+- [ ] **Blacklist de números** — lista de números que o bot deve ignorar completamente (spam, concorrentes). Armazenar em `./data/blacklist.json`. Verificar no início do webhook antes de qualquer processamento.
 
-- [ ] **Rate limiting por número** — evitar que um único número consuma tokens excessivos (ex: máximo de N chamadas à API por hora por telefone). Protege contra abuso e custo descontrolado.
+- [ ] **Blacklist automática** — se um número disparar o rate limit X vezes no mesmo dia, entra na blacklist automaticamente.
 
 ### 🟢 Baixa prioridade
 
-- [ ] **Follow-up automático** — se cliente não responde em X horas após última mensagem do bot, enviar uma mensagem de reengajamento (ex: "Ainda posso ajudar com algo?"). Cuidado: pode irritar se mal calibrado. Sugestão: só para sessões que chegaram à etapa de cotação de preço.
+- [ ] **Follow-up automático** — se cliente não responde em X horas após última mensagem do bot, enviar reengajamento ("Ainda posso ajudar?"). Só para sessões que chegaram à etapa de cotação de preço.
 
-- [ ] **Blacklist de números** — lista de números que o bot deve ignorar completamente (ex: números de spam, concorrentes). Armazenar em `./data/blacklist.json`.
+- [ ] **Detecção de mensagens repetidas** — se o cliente manda a mesma mensagem 3x seguidas, tratar como confusão e oferecer falar com atendente.
 
-- [ ] **Métricas básicas** — contador de atendimentos por dia, taxa de conversão (chegou ao chamar_atendente vs total), tempo médio de resposta. Pode ser um endpoint `/admin/metricas` ou simplesmente log estruturado.
+- [ ] **Feedback pós-atendimento** — após "atendimento encerrado", Fari envia automaticamente: "Como foi seu atendimento? 😊 Responda de 1 a 5."
 
-- [ ] **Testes automatizados** — script que simula conversas completas via `POST /testar` e verifica se as ferramentas foram chamadas corretamente. Essencial para validar mudanças no prompt sem precisar testar manualmente no WhatsApp.
+- [ ] **Métricas básicas** — endpoint `/admin/metricas` com: atendimentos por dia, taxa de conversão (chegou ao `chamar_atendente` vs total), tempo médio de resposta.
+
+- [ ] **Alerta de volume alto** — se mais de N atendimentos simultâneos ativos, notificar o grupo da equipe.
+
+- [ ] **Relatório diário automático** — às 18h, enviar no grupo: X atendimentos, X leads qualificados, X convertidos.
+
+- [ ] **Testes automatizados** — script que simula conversas completas via `POST /testar` e verifica se as ferramentas foram chamadas corretamente.
 
 ---
 
-## 6. VARIÁVEIS DE AMBIENTE
+## 7. VARIÁVEIS DE AMBIENTE
 
 | Variável | Status | Descrição |
 |---|---|---|
@@ -191,7 +205,7 @@ Campos por sessão: `historico`, `nome`, `telefone`, `pausado`, `pausadoEm`, `al
 
 ---
 
-## 7. ENDPOINTS
+## 8. ENDPOINTS
 
 | Método | Path | Descrição |
 |---|---|---|
@@ -204,7 +218,7 @@ Campos por sessão: `historico`, `nome`, `telefone`, `pausado`, `pausadoEm`, `al
 
 ---
 
-## 8. COMANDOS ÚTEIS
+## 9. COMANDOS ÚTEIS
 
 ```bash
 # Subir
@@ -216,8 +230,9 @@ docker compose logs -f agente
 # Reiniciar com novas envs
 docker compose down && docker compose up -d
 
-# Remover containers órfãos (Evolution API antiga)
-docker compose down --remove-orphans && docker compose up -d
+# Retomar bot para um número via admin
+curl -X POST http://localhost:3000/admin/retomar/559881345727 \
+  -H "x-admin-token: SEU_TOKEN"
 
 # Teste direto sem WhatsApp
 curl -X POST http://localhost:3000/testar \
@@ -233,13 +248,13 @@ npx ngrok http 3000
 
 ---
 
-## 9. DECISÕES TÉCNICAS IMPORTANTES
+## 10. DECISÕES TÉCNICAS IMPORTANTES
 
 ### Por que Z-API em vez de Evolution API?
 Evolution API v2.2.3 (latest stable) não consegue enviar mensagens para JIDs no formato `@lid` (novos IDs internos do WhatsApp). Retorna 400 ao tentar enviar. Z-API resolve LIDs internamente no servidor deles.
 
 ### Por que single-file (server.js)?
-Decisão de design inicial. Toda a lógica em um arquivo facilita deploy e entendimento, mas começa a ficar longo (~1200 linhas). Candidato a refatoração se o projeto crescer muito.
+Decisão de design inicial. Toda a lógica em um arquivo facilita deploy e entendimento, mas começa a ficar longo (~1300 linhas). Candidato a refatoração se o projeto crescer muito.
 
 ### Por que Groq para áudio e não Whisper direto?
 Groq oferece Whisper large-v3-turbo com latência muito menor que a API da OpenAI. Custo similar ou menor. Transcrição em pt-BR funciona bem.
@@ -249,3 +264,9 @@ O endpoint `B2CConsultaProdutos` retorna o catálogo inteiro (potencialmente cen
 
 ### Por que remover imagens do histórico após resposta?
 Imagens em base64 são muito grandes. Manter no histórico triplicaria o tamanho de cada chamada à API Anthropic nas mensagens subsequentes. Após a resposta, a imagem é substituída por `[imagem] [legenda]` no histórico.
+
+### Por que o horário de funcionamento é injetado no prompt e não bloqueia no código?
+Decisão de 2026-03-21: bloquear no código desperdiça leads fora do horário. A Fari atende normalmente fora do expediente, informa o horário, e passa leads qualificados para o atendente com a data/hora de retorno calculada dinamicamente. O atendente humano só responde no próximo dia útil.
+
+### Por que rate limit de 15 chamadas/hora?
+Um atendimento completo raramente passa de 10 iterações. 15 é generoso para qualquer conversa real e protege contra spam e custo descontrolado. Ao atingir o limite, o cliente é passado para um atendente em vez de ser ignorado silenciosamente.

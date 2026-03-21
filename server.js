@@ -29,7 +29,7 @@ app.use(express.json({ limit: "50mb" }));
 const PORT = process.env.PORT || 3000;
 
 /* =========================================================
-   ⚙️  CONFIGURAÇÕES
+  CONFIGURAÇÕES
 ========================================================= */
 
 const CONFIG = {
@@ -127,6 +127,9 @@ function getSessao(telefone) {
 ========================================================= */
 
 const filasPorTelefone   = new Map();
+const rateLimits         = new Map(); // telefone → { contagem, janela }
+const RATE_LIMIT_MAX     = 15;        // máx chamadas ao Claude por hora por número
+const RATE_LIMIT_JANELA  = 60 * 60 * 1000; // 1 hora em ms
 const debouncePorTelefone = new Map();
 const DEBOUNCE_MS = 1500; // agrupa mensagens enviadas em sequência em até 1.5s
 
@@ -150,6 +153,19 @@ function processarNaFila(telefone, fn) {
   });
 
   return proxima;
+}
+
+function incrementarRateLimit(telefone) {
+  const agora = Date.now();
+  const rl    = rateLimits.get(telefone);
+
+  if (!rl || agora - rl.janela > RATE_LIMIT_JANELA) {
+    rateLimits.set(telefone, { contagem: 1, janela: agora });
+    return false; // não bloqueado
+  }
+
+  rl.contagem++;
+  return rl.contagem > RATE_LIMIT_MAX; // true = bloqueado
 }
 
 /* =========================================================
@@ -250,9 +266,10 @@ const NAO_SAO_NOMES = new Set([
   "oi", "olá", "ola", "opa", "ei", "eai", "eaí", "alô", "alo", "hey", "hi",
   // respostas curtas
   "bom", "boa", "ok", "sim", "não", "nao", "bem", "certo", "tudo",
-  // verbos / pronomes
+  // verbos / pronomes / imperativos comuns
   "fala", "bora", "pode", "tem", "vai", "vem", "quer", "sou", "meu", "minha",
   "preciso", "quero", "tenho", "gostaria", "quanto", "qual", "como", "quando",
+  "manda", "passa", "faz", "traz", "liga", "chama", "faz", "diz", "dá", "da",
   // horários / períodos
   "dia", "tarde", "noite", "manha", "manhã",
   // substantivos comuns que não são nomes de pessoas
@@ -608,15 +625,63 @@ const tools = [
 ];
 
 /* =========================================================
+   🕐 HORÁRIO DE FUNCIONAMENTO
+========================================================= */
+
+function verificarHorarioFuncionamento() {
+  const agora = new Date(new Date().toLocaleString("en-US", { timeZone: "America/Sao_Paulo" }));
+  const dia   = agora.getDay(); // 0=Dom, 1=Seg, ..., 6=Sáb
+  const hora  = agora.getHours() + agora.getMinutes() / 60;
+
+  const dentro = (
+    (dia >= 1 && dia <= 5 && hora >= 8 && hora < 18) ||
+    (dia === 6 && hora >= 8 && hora < 16)
+  );
+
+  const nomesDias = ["domingo", "segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado"];
+  const horaStr   = `${agora.getHours()}h${agora.getMinutes() > 0 ? String(agora.getMinutes()).padStart(2, "0") : ""}`;
+
+  let proximoAtendimento = null;
+  if (!dentro) {
+    if ((dia >= 1 && dia <= 5) && hora < 8) {
+      proximoAtendimento = "hoje às 8h";
+    } else if (dia === 6 && hora < 8) {
+      proximoAtendimento = "hoje às 8h";
+    } else if (dia === 0 || dia === 6) {
+      proximoAtendimento = "segunda-feira às 8h";
+    } else if (dia === 5) {
+      proximoAtendimento = "segunda-feira às 8h";
+    } else {
+      proximoAtendimento = `${nomesDias[dia + 1]} às 8h`;
+    }
+  }
+
+  return { dentro, diaAtual: nomesDias[dia], horaStr, proximoAtendimento };
+}
+
+/* =========================================================
    🤖 SYSTEM PROMPT
 ========================================================= */
 
-function montarSystemPrompt(nomeCliente) {
+function montarSystemPrompt(nomeCliente, horario) {
   const saudacao = nomeCliente
     ? `O cliente se chama ${nomeCliente}. Use o nome de forma natural, só quando fizer sentido.`
     : `Ainda não sabemos o nome do cliente. Se ele se apresentar, registre internamente.`;
 
-  return `Você é atendente da Casa Faria Cohama, loja de equipamentos para food service em São Luís - MA.
+  const contextoHorario = horario.dentro ? "" : `
+## ATENÇÃO — Atendimento fora do horário comercial
+Agora são ${horario.horaStr} de ${horario.diaAtual}. A loja está fechada no momento (próximo atendimento: ${horario.proximoAtendimento}).
+Mesmo assim, atenda o cliente normalmente: responda dúvidas, consulte produtos, preços e estoque.
+Na primeira mensagem, após se apresentar, avise que a loja está fechada mas que você pode ajudar, e que na ${horario.proximoAtendimento} um vendedor dará continuidade.
+Não repita esse aviso em todas as mensagens — mencione apenas quando o cliente perguntar sobre atendimento ou compra.
+Se o cliente quiser fechar compra, execute chamar_atendente normalmente — o vendedor retornará na ${horario.proximoAtendimento}.
+`;
+
+  return `Você é a Fari, atendente virtual da Casa Faria Cohama, loja de equipamentos para food service em São Luís - MA.
+
+Na primeira mensagem de cada conversa, apresente-se: "Olá! Sou a Fari, atendente virtual da Casa Faria. Como posso te ajudar?"
+Nas demais mensagens, não se apresente novamente.
+${contextoHorario}
 
 ${saudacao}
 
@@ -661,7 +726,7 @@ Quando o cliente demonstrar interesse em comprar:
 2. Pergunte se é PJ (CNPJ com IE) ou pessoa física — isso define o desconto
 3. Pergunte a forma de pagamento (PIX ou presencial)
 4. Assim que tiver produto + quantidade + PJ/PF + pagamento: PARE DE ESCREVER e execute a ferramenta chamar_atendente imediatamente
-5. Depois que a ferramenta retornar, escreva apenas: que o atendente foi notificado e vai entrar em contato em breve
+5. Depois que a ferramenta retornar, o resultado terá um campo "proximoAtendimento". Se tiver valor, diga que o pedido foi registrado e que um vendedor vai continuar o atendimento na [proximoAtendimento]. Se não tiver, diga que o atendente vai entrar em contato em breve.
 
 CRÍTICO — COMPORTAMENTO PROIBIDO:
 - NUNCA escreva "vou chamar um atendente", "estou transferindo", "aguarde que já vou transferir" ou qualquer variação disso SEM ter chamado a ferramenta chamar_atendente primeiro
@@ -690,6 +755,34 @@ CRÍTICO — COMPORTAMENTO PROIBIDO:
 
 // conteudo: string (texto) ou array de blocos (multimodal com imagem)
 async function executarAgente(conteudo, sessao) {
+  // ── Rate limit ────────────────────────────────────────────────
+  if (incrementarRateLimit(sessao.telefone)) {
+    console.log(`🚦 [${sessao.telefone}] Rate limit atingido — passando para atendente`);
+    const horarioRl = verificarHorarioFuncionamento();
+    const destino   = CONFIG.equipe.grupo || CONFIG.equipe.numero;
+    if (destino && !sessao.pausado) {
+      const nome  = sessao.nome ? ` (${sessao.nome})` : "";
+      const aviso =
+        `🚦 *Rate limit atingido*\n` +
+        `📱 *Cliente:* ${sessao.telefone}${nome}\n` +
+        `🔗 wa.me/${sessao.telefone}\n\n` +
+        `Cliente enviou muitas mensagens em pouco tempo. Verifique o histórico.\n\n` +
+        `Para retomar o bot: retomar ${sessao.telefone}`;
+      await enviarTexto(destino, aviso);
+    }
+    sessao.pausado       = true;
+    sessao.pausadoEm     = Date.now();
+    sessao.alertaEnviado = false;
+    await salvarSessoes();
+    const quando = horarioRl.proximoAtendimento
+      ? ` Um de nossos atendentes vai te ajudar na ${horarioRl.proximoAtendimento}.`
+      : " Um de nossos atendentes vai te ajudar em breve.";
+    await enviarTexto(sessao.telefone,
+      `Recebi muitas mensagens em pouco tempo. Vou passar você para um atendente que vai te ajudar!${quando}`
+    );
+    return null;
+  }
+
   const textoPlano = typeof conteudo === "string"
     ? conteudo
     : conteudo.find(c => c.type === "text")?.text || "";
@@ -709,12 +802,13 @@ async function executarAgente(conteudo, sessao) {
 
   let resposta     = null;
   let maxIteracoes = 10;
+  const horario    = verificarHorarioFuncionamento();
 
   while (maxIteracoes-- > 0) {
     const response = await anthropic.messages.create({
       model:      CONFIG.anthropic.model,
       max_tokens: 1024,
-      system:     montarSystemPrompt(sessao.nome),
+      system:     montarSystemPrompt(sessao.nome, horario),
       tools,
       messages:   sessao.historico,
     });
@@ -762,14 +856,16 @@ async function executarAgente(conteudo, sessao) {
             await salvarSessoes();
             const destino = CONFIG.equipe.grupo || CONFIG.equipe.numero;
             if (destino) {
+              const nome = sessao.nome ? ` (${sessao.nome})` : "";
               const aviso =
-                `🔔 Atendimento solicitado\n` +
-                `Cliente: ${sessao.telefone}\n\n` +
-                `${bloco.input.resumo}\n\n` +
+                `🔔 *Atendimento solicitado*\n` +
+                `📱 *Cliente:* ${sessao.telefone}${nome}\n` +
+                `🔗 wa.me/${sessao.telefone}\n\n` +
+                `📋 *Resumo:*\n${bloco.input.resumo}\n\n` +
                 `Para retomar o bot: retomar ${sessao.telefone}`;
               await enviarTexto(destino, aviso);
             }
-            resultado = { notificado: true };
+            resultado = { notificado: true, proximoAtendimento: horario.proximoAtendimento };
             break;
           }
           default:
@@ -1029,7 +1125,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
           const resposta = await executarAgente(transcricao, sessao);
           const decorrido = Date.now() - inicioMs;
           if (decorrido < 3000) await new Promise(r => setTimeout(r, 3000 - decorrido));
-          await enviarResposta(telefone, resposta);
+          if (resposta !== null) await enviarResposta(telefone, resposta);
         } catch (err) {
           console.error("❌ Erro ao transcrever áudio:", err.message);
           await enviarTexto(telefone, "Não consegui entender o áudio. Pode digitar sua mensagem?");
@@ -1063,7 +1159,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
           const resposta = await executarAgente(conteudo, sessao);
           const decorrido = Date.now() - inicioMs;
           if (decorrido < 3000) await new Promise(r => setTimeout(r, 3000 - decorrido));
-          await enviarResposta(telefone, resposta);
+          if (resposta !== null) await enviarResposta(telefone, resposta);
         } catch (err) {
           console.error("❌ Erro ao processar imagem:", err.message);
           await enviarTexto(telefone, "Não consegui analisar a imagem. Pode descrever o que precisa?");
@@ -1123,7 +1219,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
           await new Promise(r => setTimeout(r, 3000 - decorrido));
         }
 
-        await enviarResposta(telefone, resposta);
+        if (resposta !== null) await enviarResposta(telefone, resposta);
       });
     }, DEBOUNCE_MS);
 
